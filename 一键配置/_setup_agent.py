@@ -614,7 +614,8 @@ def zcode_provider_block(name: str, base: str, key: str) -> dict:
         "kind": "openai-compatible",
         "options": {"apiKey": key, "baseURL": base, "apiKeyRequired": True},
         "source": "custom",
-        "enabled": True,
+        # 注意：不写 enabled 键——ZCode 界面添加的自定义供应商没有该键，
+        # 缺省即为启用；多写无益，尽量与界面产出逐字段一致。
         "models": {
             MODEL_ID: {
                 "limit": {"context": CONTEXT, "output": OUTPUT},

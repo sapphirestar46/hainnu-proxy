@@ -435,6 +435,10 @@ python -c "import token_codec;print(token_codec.decrypt(open('token.txt',encodin
 
 将输出字符串填入客户端配置的 `apiKey`。
 
+更省事：打开管理台（`启动管理台.bat`），在「连接配置」卡里直接**复制**「直连URL」与
+「直连Key」两行——值与本节命令的输出同源（Key 在 GUI 启动时读取一次，重新登录令牌后
+需重启管理台刷新）。
+
 ⚠️ 该 JWT **不含过期时间**（payload 无 `exp` 字段），通常一次填写长期有效；需重新获取的情形同上 §6.3。
 该 JWT 等同账号凭据，禁止外传，禁止粘贴至对话、日志或代码仓库。
 

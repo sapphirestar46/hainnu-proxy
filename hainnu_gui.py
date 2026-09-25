@@ -1158,13 +1158,17 @@ class HainnuGUI(tk.Tk):
         cfg.pack(side="left", fill="both", expand=True, padx=(8, 0))
         cdata = load_config()
 
-        def cfg_row(label, var):
+        def cfg_row(label, var, readonly=False):
             r = tk.Frame(cfg_body, bg=UI["card"])
             r.pack(fill="x", pady=2)
             # 宽度给足：中文是双宽字符，width=5 会裁掉「本地ANTH」这类较长前缀（被 URL 前的文字遮挡）
             lbl(r, label, width=11, anchor="w", font=F_SMALL,
                 fg=UI["text_secondary"]).pack(side="left")
-            entry(r, var).pack(side="left", fill="x", expand=True, ipady=2)
+            e = entry(r, var)
+            if readonly:
+                # 只读展示（值由程序推导，不该手改）；仍可全选复制
+                e.config(state="readonly")
+            e.pack(side="left", fill="x", expand=True, ipady=2)
             btn(r, "复制", lambda v=var: (
                 self.clipboard_clear(), self.clipboard_append(v.get()), self.update()
             ), 4, font=F_SMALL).pack(side="left", padx=(6, 0))
@@ -1202,6 +1206,23 @@ class HainnuGUI(tk.Tk):
             side="left", padx=(6, 0))
 
         cfg_row("端口", self._c_port)
+
+        # ---- 直连设置（只读展示 + 一键复制）：让支持自定义供应商的客户端跳过
+        # 本地桥、直连学校上游。URL 由 config.json 的 upstream 推导；Key 与
+        # token.txt 同源（DPAPI 解密，等同密码），随 GUI 启动读取一次。
+        _up = str(cdata.get("upstream") or "").rstrip("/")
+        self._c_url_direct = tk.StringVar(
+            value=(_up + "/api") if _up else "（config.json 缺 upstream，无法直连）")
+        cfg_row("直连URL", self._c_url_direct, readonly=True)
+        try:
+            _jwt_direct = token_codec.decrypt(
+                (BASE / "token.txt").read_text(encoding="utf-8").strip()) or ""
+        except Exception:  # noqa: BLE001
+            _jwt_direct = ""
+        self._c_key_direct = tk.StringVar(
+            value=_jwt_direct or "未获取（先双击「1.获取令牌.bat」）")
+        cfg_row("直连Key", self._c_key_direct, readonly=True)
+
         self._cfg_status = lbl(cfg_body, "改后点「保存」，重启代理生效。",
                                anchor="w", font=F_SMALL, fg=UI["text_hint"])
         self._cfg_status.pack(fill="x", pady=(4, 0))

@@ -1,9 +1,10 @@
-"""把学校大模型一键配置到三个 Agent 客户端的**配置文件**里。
+"""把学校大模型一键配置到多个 Agent 客户端的**配置文件**里。
 
 支持的目标（`--agent`）：
     opencode   →  opencode.jsonc        （JSONC，带注释，不能整体反序列化）
     workbuddy  →  models.json           （JSON：{"models": [...], "availableModels": [...]}）
     dsh        →  settings.yaml         （YAML：llm-pi-ai.providers.<id>）
+    zcode      →  ~/.zcode/v2/config.json（纯 JSON：provider.<uuid>，可整体读写）
 支持的两条链路（`--mode`）：
     proxy     →  经本项目的本地服务（Base URL 127.0.0.1:<port>/v1，本地 key）
     direct     →  直连学校（Base URL <upstream>/api，学校登录 JWT）
@@ -23,10 +24,11 @@
     · 经本地服务的链路还要求「本地代理正在运行」（2.启动代理.bat）；
     · 客户端只在启动时读配置，改完必须**重启客户端**。
 
-用法（一般由本目录里的 6 个 bat 调用）：
+用法（一般由本目录里的 7 个 bat 调用）：
     python _setup_agent.py --agent opencode  --mode proxy
     python _setup_agent.py --agent workbuddy --mode direct
     python _setup_agent.py --agent dsh       --mode proxy  --config <配置文件路径>
+    python _setup_agent.py --agent zcode     --mode direct  --yes
     python _setup_agent.py --agent opencode  --mode direct  --dry-run   # 只看不改
     python _setup_agent.py --agent dsh       --mode direct  --refresh-env   # 令牌轮换后只刷新 DSH 环境变量
 """
@@ -39,6 +41,7 @@ import re
 import shutil
 import sys
 import time
+import uuid
 from pathlib import Path
 
 for _stream in (sys.stdout, sys.stderr):
@@ -135,6 +138,11 @@ def candidates(agent: str) -> list[tuple[str, Path]]:
             out.append(("XDG_CONFIG_HOME", Path(xdg) / "dsh" / "settings.yaml"))
         out.append(("用户级默认", h / ".dsh" / "settings.yaml"))
 
+    elif agent == "zcode":
+        if env.get("ZCODE_CONFIG_DIR"):
+            out.append(("环境变量 ZCODE_CONFIG_DIR", Path(env["ZCODE_CONFIG_DIR"]) / "config.json"))
+        out.append(("用户级默认", h / ".zcode" / "v2" / "config.json"))
+
     return out
 
 
@@ -150,6 +158,8 @@ def looks_right(agent: str, path: Path) -> bool:
         return t.strip().startswith(("[", "{"))
     if agent == "dsh":
         return "settings" in t or ":" in t
+    if agent == "zcode":
+        return '"provider"' in t or '"models"' in t
     return True
 
 
@@ -190,7 +200,8 @@ def pick_config(agent: str, given: str | None) -> Path:
         return default
     p = Path(raw).expanduser()
     if p.is_dir():
-        p = p / {"opencode": "opencode.jsonc", "workbuddy": "models.json", "dsh": "settings.yaml"}[agent]
+        p = p / {"opencode": "opencode.jsonc", "workbuddy": "models.json",
+                 "dsh": "settings.yaml", "zcode": "config.json"}[agent]
     if not p.exists():
         print("（该文件尚不存在，将新建：%s）" % p)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -286,6 +297,10 @@ def validate(agent: str, text: str) -> None:
         data = json.loads(text)
         if not isinstance(data, dict):
             raise ValueError("顶层必须是对象 {\"models\": [...]}（原来是数组会被客户端忽略）")
+    elif agent == "zcode":
+        data = json.loads(strip_jsonc(text))
+        if not isinstance(data, dict) or not isinstance(data.get("provider"), dict):
+            raise ValueError("顶层必须含 provider 对象")
     elif agent == "dsh":
         try:
             import yaml  # noqa: PLC0415
@@ -589,6 +604,57 @@ def opencode_set_default(text: str, ref: str) -> str:
     return stripped + comma + '\n  "model": "%s"\n' % ref + tail + "\n"
 
 
+# ---- zcode（~/.zcode/v2/config.json，纯 JSON 可整体读写）--------------------
+def zcode_provider_block(name: str, base: str, key: str) -> dict:
+    return {
+        "name": name,
+        # 学校端点只实现了 Chat Completions（/api/chat/completions），没有 OpenAI 的
+        # Responses API → 必须用 openai-compatible（ZCode 对它拼接 /chat/completions）。
+        # kind 填 "openai" 会被拼成 /responses，直接 404。
+        "kind": "openai-compatible",
+        "options": {"apiKey": key, "baseURL": base, "apiKeyRequired": True},
+        "source": "custom",
+        "enabled": True,
+        "models": {
+            MODEL_ID: {
+                "limit": {"context": CONTEXT, "output": OUTPUT},
+                "modalities": {"input": ["text", "image"], "output": ["text"]},
+                "zcode": {"modalitiesConfigured": True, "modified": True},
+            }
+        },
+        "zcode": {"deletedModels": []},
+    }
+
+
+def zcode_apply(text: str, name: str, base: str, key: str) -> str:
+    """在 provider 下插入/更新海师供应商；重复执行只更新同一块，不堆积副本。
+
+    ZCode 的这份配置是机器写的纯 JSON（无注释），整体反序列化回写是无损的，
+    与 opencode/DSH 的「定点文本替换」约束不冲突。provider 键沿用 ZCode 自己
+    生成自定义供应商时用的 UUID 风格；已有海师供应商按 baseURL + 模型识别。
+    """
+    data = json.loads(strip_jsonc(text)) if text.strip() else {}
+    if not isinstance(data, dict):
+        raise SystemExit("[错误] ZCode 配置顶层不是对象，请手工检查。")
+    providers = data.setdefault("provider", {})
+    if not isinstance(providers, dict):
+        raise SystemExit("[错误] ZCode 配置的 provider 段不是对象，请手工检查。")
+
+    def is_ours(v: dict) -> bool:
+        b = str((v.get("options") or {}).get("baseURL") or "")
+        if "hainnu.edu.cn" not in b and b.rstrip("/") != base.rstrip("/"):
+            return False
+        return MODEL_ID in (v.get("models") or {})
+
+    target = next((k for k, v in providers.items()
+                   if isinstance(v, dict) and is_ours(v)), None)
+    if target is None:
+        target = str(uuid.uuid4())
+    providers[target] = zcode_provider_block(name, base, key)
+    data["provider"] = providers
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
 # ---- 前置条件（配置好 ≠ 能跑，这里把「还差什么」讲清楚）--------------------
 def probe_local_service(port: int) -> bool:
     """探测本地代理是否在跑。注意：桥是单线程的，忙起来 /health 也不回 → 不通不代表没在跑。"""
@@ -673,7 +739,7 @@ def check_prereqs(mode: str, port: int, auto: bool) -> bool:
 # ---- 主流程 ----------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--agent", required=True, choices=["opencode", "workbuddy", "dsh"])
+    ap.add_argument("--agent", required=True, choices=["opencode", "workbuddy", "dsh", "zcode"])
     ap.add_argument("--mode", required=True, choices=["proxy", "direct"])
     ap.add_argument("--config", default=None, help="手动指定配置文件路径（自动定位失败时用）")
     ap.add_argument("--dry-run", action="store_true", help="只打印将写入的内容，不落盘")
@@ -700,7 +766,8 @@ def main() -> int:
         print("  重开终端 / 重启 DSH 后生效。")
         return 0
 
-    agent_label = {"opencode": "opencode", "workbuddy": "WorkBuddy", "dsh": "DeepSeek-Harness (DSH)"}[args.agent]
+    agent_label = {"opencode": "opencode", "workbuddy": "WorkBuddy",
+                   "dsh": "DeepSeek-Harness (DSH)", "zcode": "ZCode"}[args.agent]
     mode_label = "经本地服务（127.0.0.1）" if args.mode == "proxy" else "直连学校"
     pid = "hainnu" if args.mode == "proxy" else "hainnu-direct"
     name = MODEL_NAME_PROXY if args.mode == "proxy" else MODEL_NAME_DIRECT
@@ -726,6 +793,10 @@ def main() -> int:
                 print("已取消，未做任何改动。")
                 return 0
 
+    if args.agent == "zcode":
+        print("\n  ⚠️ 若 ZCode 正在运行，请先**完全退出**再继续——")
+        print("     它退出时可能回写配置文件，覆盖本次改动。")
+
     path = pick_config(args.agent, args.config)
     old = path.read_text(encoding="utf-8") if path.exists() else ""
 
@@ -735,13 +806,15 @@ def main() -> int:
     elif args.agent == "workbuddy":
         ref = f"{pid}/{MODEL_ID}"
         new = workbuddy_apply(old, workbuddy_entry(ref, name, base, key))
+    elif args.agent == "zcode":
+        new = zcode_apply(old, name, base, key)
     else:
         ref = f"{pid}/{MODEL_ID}"
         new = dsh_apply(old, pid, dsh_block(pid, name, base, args.mode))
 
     # 是否顺带把它设为该客户端的默认模型（不设也能用，只是每次要手动切）
-    if args.agent == "workbuddy":
-        pass  # WorkBuddy 在界面里选模型，没有可写的「默认模型」字段
+    if args.agent in ("workbuddy", "zcode"):
+        pass  # WorkBuddy / ZCode 在界面里选模型，没有可写的「默认模型」字段
     elif args.yes or ask_yes_no("\n  同时把它设为 %s 的默认模型？[Y/n] " % agent_label, False):
         new = (opencode_set_default(new, ref) if args.agent == "opencode"
                else dsh_set_default(new, pid))
@@ -777,6 +850,8 @@ def main() -> int:
             print("       请手动设置后重开终端：setx %s \"<密钥>\"" % var)
     elif args.agent == "opencode":
         print("\n  验证：opencode models %s" % pid)
+    elif args.agent == "zcode":
+        print("\n  验证：重启 ZCode → 设置 → 模型供应商 里应出现「%s」，选择 %s。" % (name, MODEL_ID))
     else:
         print("\n  验证：在 WorkBuddy 的模型列表里选择「%s」。" % name)
     if args.mode == "proxy":

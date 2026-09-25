@@ -438,9 +438,9 @@ python -c "import token_codec;print(token_codec.decrypt(open('token.txt',encodin
 ⚠️ 该 JWT **不含过期时间**（payload 无 `exp` 字段），通常一次填写长期有效；需重新获取的情形同上 §6.3。
 该 JWT 等同账号凭据，禁止外传，禁止粘贴至对话、日志或代码仓库。
 
-### 8.6 一键配置脚本（可选，6 个入口）
+### 8.6 一键配置脚本（可选，7 个入口）
 
-`一键配置/` 目录提供 6 个 bat，把接口参数**写入客户端自己的配置文件**，与 §8.2 的手工配置等价，
+`一键配置/` 目录提供 7 个 bat，把接口参数**写入客户端自己的配置文件**，与 §8.2 的手工配置等价，
 只是把「找文件 → 定位段落 → 插入 → 备份 → 校验」自动化。
 
 | 入口 | 客户端 | 链路 | 写入内容 |
@@ -451,11 +451,12 @@ python -c "import token_codec;print(token_codec.decrypt(open('token.txt',encodin
 | `配置到 WorkBuddy(直连学校).bat` | WorkBuddy | 直连 | `models.json` 的模型项（含明文 JWT） |
 | `配置到 DeepSeek-Harness(经本地服务).bat` | DSH | 经本地服务 | `settings.yaml` 的 `llm-pi-ai.providers.hainnu` |
 | `配置到 DeepSeek-Harness(直连学校).bat` | DSH | 直连 | `llm-pi-ai.providers.hainnu-direct` |
+| `配置到 ZCode(直连学校).bat` | ZCode | 直连 | `~/.zcode/v2/config.json` 的 `provider`（含明文 JWT） |
 
-六个入口共用同一核心脚本 `一键配置/_setup_agent.py`，差异仅在 `--agent` 与 `--mode` 两个参数。
+七个入口共用同一核心脚本 `一键配置/_setup_agent.py`，差异仅在 `--agent` 与 `--mode` 两个参数。
 
 **配置文件定位（不写死任何安装位置）**：① 按「用户主目录 + 官方环境变量」推算候选
-（`OPENCODE_CONFIG`、`XDG_CONFIG_HOME`、`WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR`、`DSH_CONFIG_DIR`）；
+（`OPENCODE_CONFIG`、`XDG_CONFIG_HOME`、`WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR`、`DSH_CONFIG_DIR`、`ZCODE_CONFIG_DIR`）；
 ② 多个候选时列出序号供选择；③ 均未找到时提示把配置文件**拖进窗口**或输入路径，也可直接回车新建；
 ④ 选中的文件若不像目标客户端的配置，会再确认一次。
 
@@ -463,7 +464,7 @@ python -c "import token_codec;print(token_codec.decrypt(open('token.txt',encodin
 
 - **定点改写**：JSONC 与 YAML 通常带大量注释，脚本只做文本级插入/替换，不整体反序列化再导出（否则丢失全部注释）；
 - **幂等 + 可回滚**：重复执行只更新自己那一段，不堆积副本；写前生成 `.bak-<时间戳>` 备份，写后重新读取校验，不通过自动回滚；
-- **设为默认模型**：opencode 同时更新顶层 `model`，DSH 写入 `agent-default-model`（WorkBuddy 在界面选模型，无可写默认字段，跳过）；
+- **设为默认模型**：opencode 同时更新顶层 `model`，DSH 写入 `agent-default-model`（WorkBuddy / ZCode 在界面里选模型，无可写默认字段，跳过）；
 - 可选参数：`--config "<路径>"` 指定文件、`--dry-run` 只预览不落盘、`--yes` 跳过交互。
 
 **⚠️ 配置完成 ≠ 立即可用**（脚本结束时会逐条列出还缺什么）

@@ -1124,31 +1124,57 @@ class HainnuGUI(tk.Tk):
         prow = tk.Frame(cost_body, bg=UI["card"])
         prow.pack(fill="x")
         self.btn_price = btn(prow, "更新价格", self._fetch_price_now, 8)
-        self.btn_price.pack(side="left")
-        self.l_saved = lbl(cost_body, "学校为你节省了 ¥0.00（累计）", anchor="w",
-                           font=(FONT_FAMILY, 11, "bold"), fg=UI["success"])
-        self.l_saved.pack(fill="x", pady=(6, 0))
-        # 累计 tokens 总量（学校为你节省这行下面再一行）
-        self.l_tokens_total = lbl(cost_body, "累计消耗：— tokens", anchor="w")
-        self.l_tokens_total.pack(fill="x", pady=(6, 0))
-        # 今日消耗（本地 0 点至今，跟「24小时」图的起点同口径）
-        self.l_tokens_today = lbl(cost_body, "今日消耗：— tokens", anchor="w")
-        self.l_tokens_today.pack(fill="x")
-        # 缓存命中（prompt cache）：上游 usage 的 prompt_cache_hit_tokens。
-        # 一行放不下「命中数 + 总量 + 命中率 + 命中次数」，所以用两行（今日 / 累计）。
-        self.l_cache = lbl(cost_body, "缓存命中：—", anchor="w", justify="left",
-                           fg=UI["teal"])
-        self.l_cache.pack(fill="x", pady=(6, 0))
+
+        # ---- 统计瓦片（视觉参考 sub2api 仪表盘）：浅色圆角芯片 + 大数字 + 小字明细 ----
+        TILE_BG = "#F7F8FA"                       # 瓦片底：比卡片白底略深，撑出「卡中卡」层次
+
+        def stat_tile(parent, chip_bg, chip_fg, glyph, caption, value_fg):
+            t = tk.Frame(parent, bg=TILE_BG, highlightbackground=UI["divider"],
+                         highlightthickness=1)
+            head = tk.Frame(t, bg=TILE_BG)
+            head.pack(fill="x", padx=8, pady=(6, 0))
+            tk.Label(head, text=glyph, bg=chip_bg, fg=chip_fg,
+                     font=(FONT_FAMILY, 11, "bold"), width=2).pack(side="left")
+            col = tk.Frame(head, bg=TILE_BG)
+            col.pack(side="left", fill="x", expand=True, padx=(8, 0))
+            # 瓦片内部底色是 TILE_BG 而非卡片白，故不走 lbl()（它固定 bg=card）
+            tk.Label(col, text=caption, bg=TILE_BG, fg=UI["text_secondary"],
+                     font=F_SMALL, anchor="w").pack(fill="x")
+            v = tk.Label(col, text="—", bg=TILE_BG, fg=value_fg,
+                         font=(FONT_FAMILY, 13, "bold"), anchor="w")
+            v.pack(fill="x")
+            sub = tk.Label(t, text=" ", bg=TILE_BG, fg=UI["text_hint"],
+                           font=F_SMALL, anchor="w", justify="left", wraplength=150)
+            sub.pack(fill="x", padx=8, pady=(1, 6))
+            return t, v, sub
+
+        grid = tk.Frame(cost_body, bg=UI["card"])
+        grid.pack(fill="x", pady=(6, 0))
+        grid.columnconfigure((0, 1), weight=1, uniform="stat")
+
+        t1, self.l_saved, self.l_saved_sub = stat_tile(
+            grid, "#D1FAE5", "#059669", "¥", "累计节省", UI["success"])
+        t1.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+        t2, self.l_tokens_today, self.l_tokens_today_sub = stat_tile(
+            grid, "#DBEAFE", "#2563EB", "今", "今日消耗", UI["text_main"])
+        t2.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
+        t3, self.l_tokens_total, self.l_tokens_total_sub = stat_tile(
+            grid, "#E0E7FF", "#4F46E5", "Σ", "累计消耗", UI["text_main"])
+        t3.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+        t4, self.l_cache, self.l_cache_sub = stat_tile(
+            grid, "#EDE9FE", "#7C3AED", "%", "缓存命中（今日）", UI["text_main"])
+        t4.grid(row=1, column=1, sticky="nsew")
+
         # 官方峰/谷状态：峰值=波峰(红加粗“梁文峰”)，空闲=波谷(绿加粗“梁文谷”)
         pkrow = tk.Frame(cost_body, bg=UI["card"])
-        pkrow.pack(fill="x")
+        pkrow.pack(fill="x", pady=(8, 0))
         lbl(pkrow, "官方当前是：", fg=UI["text_secondary"], anchor="w").pack(side="left")
         self.l_peak_state = tk.Label(pkrow, text="…", bg=UI["card"],
                                      font=(FONT_FAMILY, 10, "bold"))
         self.l_peak_state.pack(side="left")
         self.l_price = lbl(cost_body, "官方价：未获取", anchor="w", font=F_SMALL,
                            fg=UI["text_secondary"])
-        self.l_price.pack(fill="x", pady=(6, 0))
+        self.l_price.pack(fill="x", pady=(4, 0))
         # 空闲/高峰时段 + 是否已联网更新：独立一行（原与价格挤一行、太长）
         self.l_price_note = lbl(cost_body, "空闲时段 …", anchor="w", font=F_SMALL,
                                 fg=UI["text_secondary"])
@@ -2023,21 +2049,22 @@ class HainnuGUI(tk.Tk):
             text=(f"输入 {fmt_tokens(total_in)} · 输出 {fmt_tokens(total_out)} · "
                   f"合计 {fmt_tokens(total_in + total_out)} tokens · {count} 次请求"
                   + self._avg_text(sec, unit_sec, total_in, total_out, count)))
-        # 累计 tokens 总量（历史全部）
-        self.l_tokens_total.config(text=f"累计消耗：{fmt_tokens(cumulative_tokens())} tokens")
+        # 统计瓦片：累计 / 今日 tokens（历史全部；今日为本地 0 点起）
+        self.l_tokens_total.config(text=fmt_tokens(cumulative_tokens()))
+        self.l_tokens_total_sub.config(text=f"共 {cumulative_tokens():,} tokens")
         _today = today_tokens()
-        self.l_tokens_today.config(text=f"今日消耗：{fmt_tokens(_today)} tokens")
+        self.l_tokens_today.config(text=fmt_tokens(_today))
+        self.l_tokens_today_sub.config(text=f"共 {_today:,} tokens")
         # 缓存命中率（今日 / 累计）。两条口径都用 calendar_anchor 的「0 点」起点。
         _ca = cache_stats_since(0.0)
         if _ca["known_requests"]:
             _ct = cache_stats_since(calendar_anchor(86400) or 0.0)
-            self.l_cache.config(
-                text=("缓存命中：今日 " + fmt_cache_line(_ct)
-                      + "\n　　　　　累计 " + fmt_cache_line(_ca)),
-                fg=UI["teal"])
+            self.l_cache.config(text=fmt_tokens(_ct["hit_tokens"]))
+            self.l_cache_sub.config(
+                text=f"命中率 {(_ct['rate'] or 0):.1f}% · 累计 {fmt_cache_line(_ca)}")
         else:
-            self.l_cache.config(
-                text="缓存命中：暂无缓存信息（重启代理后，新请求才会记录）", fg=UI["text_hint"])
+            self.l_cache.config(text="—")
+            self.l_cache_sub.config(text="暂无缓存信息（重启代理后记录）")
         self._draw_line(bins, bout, brate, (hit_t, miss_t))
         self._update_savings()
         self._refresh_price_label()
@@ -2455,7 +2482,8 @@ class HainnuGUI(tk.Tk):
         if added:
             self.saved_yuan += added
             self._persist_savings()
-        self.l_saved.config(text=f"学校为你节省了 ¥{self.saved_yuan:.2f}（累计）")
+        self.l_saved.config(text=f"¥{self.saved_yuan:.2f}")
+        self.l_saved_sub.config(text="按官方单价折算的等额费用")
 
     def _fetch_price_now(self, quiet: bool = False):
         """拉一次价格。quiet=True 用于启动时的静默更新：失败不弹红字、不刷状态栏。"""

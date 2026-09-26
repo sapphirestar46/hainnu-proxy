@@ -130,6 +130,7 @@ F8 curl 返回 403 或无法连接本地端口 → 本机设置了 HTTP_PROXY �
 
 - 一键写入客户端配置：`一键配置\配置到 <客户端>(经本地服务|直连学校).bat`（支持 `--config "<路径>"`、`--dry-run`、`--yes`）。
 - 更新 opencode 直连令牌：`更新令牌(opencode直连).bat`（**仅 opencode 适用**）。
+- 更新 DSH 直连令牌：`更新令牌(DSH直连).bat`（只刷新用户级环境变量 `HAINNU_DIRECT_API_KEY`，不改配置文件）。
 - 修改 DSH 上下文上限：`8.设置上下文上限.bat`（DSH 专用）。
 
 ---
@@ -148,6 +149,7 @@ F8 curl 返回 403 或无法连接本地端口 → 本机设置了 HTTP_PROXY �
 | `7.恢复监测.bat` | 每 60 秒探测学校后端，恢复后响铃提示 |
 | `8.设置上下文上限.bat` / `set_context_window.py` | **DSH 专用**：修改 DSH 的 `contextWindow`（默认预演，`--apply` 写入，备份 + 幂等 + 校验 + 回滚） |
 | `更新令牌(opencode直连).bat` / `_update_direct_token.py` | **opencode 专用**：把解密后的 JWT 写入 `hainnu-direct` 的 `apiKey`（定点替换，备份 + 校验 + 回滚） |
+| `更新令牌(DSH直连).bat` | **DSH 专用**：把最新 JWT 写入用户级环境变量 `HAINNU_DIRECT_API_KEY`（`--refresh-env`，不改配置文件） |
 | `一键配置/_setup_agent.py` + 6 个 `配置到 *.bat` | 可选：把两条链路的参数写入 opencode / WorkBuddy / DSH 的配置文件（自动定位 + 手动指定、备份 + 校验 + 回滚 + 幂等） |
 | `run_hidden.vbs` | 静默启动服务（自动定位自身目录，可复制到任意机器与路径） |
 | `_find_python.bat` | 自动探测本机 Python（`runtime\` → `.venv\` → `py` → `python` → `python3`） |

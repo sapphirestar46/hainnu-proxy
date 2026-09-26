@@ -48,6 +48,7 @@ FILES = [
     "7.恢复监测.bat",
     "8.设置上下文上限.bat",
     "更新令牌(opencode直连).bat",    # 直连链路的令牌维护（README §8.5），属功能件
+    "更新令牌(DSH直连).bat",         # DSH 直连：刷新 HAINNU_DIRECT_API_KEY（README §8.5）
     "启动管理台.bat",
     "_find_python.bat",          # 上面几乎每个 bat 都要调它
     "start.bat",

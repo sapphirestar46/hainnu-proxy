@@ -2094,7 +2094,7 @@ class HainnuGUI(tk.Tk):
         c.delete("all")
         sec = self._window[0]
         # 右侧要放两列刻度：输出 + 缓存命中率（跟输出轴同一套画法，各占一列）
-        pad_l, pad_r, pad_t, pad_b = 48, 96, 26, 44
+        pad_l, pad_r, pad_t, pad_b = 80, 96, 26, 44
         ch = H - pad_t - pad_b
         cw = W - pad_l - pad_r
         n = len(bins)

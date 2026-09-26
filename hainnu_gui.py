@@ -402,9 +402,9 @@ def nice_ceil(v: float) -> float:
     return 10 * mag
 
 
-def beijing_peak() -> bool:
+def beijing_peak(t: float | None = None) -> bool:
     """北京时间周一至周五 9:00-12:00、14:00-18:00 为高峰时段，其余为空闲时段。"""
-    bj = time.gmtime(time.time() + 8 * 3600)
+    bj = time.gmtime((t if t is not None else time.time()) + 8 * 3600)
     return bj.tm_wday < 5 and ((9 <= bj.tm_hour < 12) or (14 <= bj.tm_hour < 18))
 
 
@@ -788,6 +788,7 @@ WINDOWS = [
     ("1周", 604800, 168),       # 1小时/桶（7天×24；每天1个端点太少）
     ("1月", 2_592_000, 60),     # 半天(12h)/桶（30天×2）
 ]
+TABLE_PAGE = 50                  # 用量表每页条数
 
 
 def agg_usage(window: int, nbuckets: int):
@@ -954,8 +955,8 @@ class HainnuGUI(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.geometry("1240x700")
-        self.minsize(1040, 560)
+        self.geometry("1240x860")
+        self.minsize(1040, 720)
         self.configure(bg=UI["bg"])
         self._user_name = _load_user_name()   # 登录时保存的姓名（get_token.py 写入 user_name.txt）
         self._last_greet_hour = time.localtime().tm_hour
@@ -1080,6 +1081,18 @@ class HainnuGUI(tk.Tk):
                   bordercolor=[("active", UI["primary"]), ("focus", UI["primary"])],
                   fieldbackground=[("readonly", UI["card"])],
                   foreground=[("readonly", UI["text_main"])])
+        style.configure("Usage.Treeview",
+                        background=UI["card"], fieldbackground=UI["card"],
+                        foreground=UI["text_main"], bordercolor=UI["border"],
+                        lightcolor=UI["card"], darkcolor=UI["card"],
+                        rowheight=28, font=F_BODY)
+        style.configure("Usage.Treeview.Heading",
+                        background=UI["card"], foreground=UI["text_secondary"],
+                        font=F_SMALL_B, relief="flat", padding=(6, 4))
+        style.map("Usage.Treeview",
+                  background=[("selected", UI["hover"])],
+                  foreground=[("selected", UI["text_main"])])
+        style.configure("Usage.Treeview", indent=0)
 
         # 头部：白底标题栏 + 状态点，下方一条细分隔线
         head = tk.Frame(self, bg=UI["card"])
@@ -1296,9 +1309,34 @@ class HainnuGUI(tk.Tk):
                             anchor="w", font=F_BODY)
         self.txt.pack(side="left", fill="x", expand=True, padx=10)
 
-        # 用量面板
-        use, use_body = card(self, "历史令牌流量（tokens）")
+        # 用量面板：标题行右侧「曲线 / 表格」切换（表格只展示 usage_log 里实际有的字段）
+        use = tk.Frame(self, bg=UI["card"], bd=0,
+                       highlightbackground=UI["border"], highlightthickness=1)
         use.pack(fill="both", expand=True, **pad)
+        title_row = tk.Frame(use, bg=UI["card"])
+        title_row.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(title_row, text="历史令牌流量（tokens）", bg=UI["card"],
+                 fg=UI["text_main"], font=F_CARD, anchor="w").pack(side="left")
+        sw = tk.Frame(title_row, bg=UI["card"])
+        sw.pack(side="right")
+        self.var_view = tk.StringVar(value="chart")
+        self.l_view_chart = tk.Label(sw, text="曲线", bg=UI["card"],
+                                     fg=UI["text_main"], font=F_SMALL)
+        self.l_view_chart.pack(side="left")
+        self._sw = tk.Canvas(sw, width=40, height=22, bg=UI["card"],
+                             highlightthickness=0, cursor="hand2")
+        self._sw.pack(side="left", padx=6)
+        self._sw.bind("<Button-1>", lambda _e: self._set_usage_view(
+            "table" if self.var_view.get() == "chart" else "chart"))
+        self.l_view_table = tk.Label(sw, text="表格", bg=UI["card"],
+                                     fg=UI["text_hint"], font=F_SMALL)
+        self.l_view_table.pack(side="left")
+        self._paint_switch()
+        tk.Frame(use, bg=UI["divider"], height=1, bd=0,
+                 highlightthickness=0).pack(fill="x", padx=12)
+        use_body = tk.Frame(use, bg=UI["card"])
+        use_body.pack(fill="both", expand=True, padx=12, pady=(8, 10))
+
         row = tk.Frame(use_body, bg=UI["card"])
         row.pack(fill="x")
         self.var_win = tk.StringVar(value="24小时")
@@ -1317,6 +1355,47 @@ class HainnuGUI(tk.Tk):
                                 highlightthickness=1,
                                 highlightbackground=UI["border"])
         self.canvas.pack(fill="both", expand=True, pady=(4, 0))
+
+        self.tbl_frame = tk.Frame(use_body, bg=UI["card"])
+        tree_row = tk.Frame(self.tbl_frame, bg=UI["card"])
+        tree_row.pack(fill="both", expand=True)
+        cols = ("ts", "effort", "tokens", "ms", "cost", "rate")
+        self.usage_tree = ttk.Treeview(tree_row, columns=cols,
+                                       show="tree headings", style="Usage.Treeview")
+        self.usage_tree.heading("#0", text="模型")
+        self.usage_tree.column("#0", width=200, minwidth=90, stretch=False, anchor="w")
+        heads = (("ts", "时间", 120, "w", False),
+                 ("effort", "推理等级", 84, "w", False),
+                 ("tokens", "输入 / 缓存 / 输出", 300, "e", False),
+                 ("ms", "用时", 72, "e", False),
+                 ("cost", "花费", 96, "e", False),
+                 ("rate", "命中率", 84, "e", False))
+        for cid, text, w, anc, stretch in heads:
+            self.usage_tree.heading(cid, text=text)
+            self.usage_tree.column(cid, width=w, minwidth=48, anchor=anc, stretch=stretch)
+        self._ico_ds = self._load_ds_icon()
+        sb = ttk.Scrollbar(tree_row, orient="vertical",
+                           command=self.usage_tree.yview)
+        self.usage_tree.configure(yscrollcommand=sb.set)
+        self.usage_tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        pager = tk.Frame(self.tbl_frame, bg=UI["card"])
+        pager.pack(fill="x", pady=(6, 0))
+        self.btn_tbl_prev = btn(pager, "上一页", lambda: self._tbl_goto(self._tbl_page - 1),
+                                8, font=F_SMALL)
+        self.btn_tbl_prev.pack(side="left")
+        self.l_tbl_page = tk.Label(pager, text="第 1 / 1 页", bg=UI["card"],
+                                   fg=UI["text_secondary"], font=F_SMALL)
+        self.l_tbl_page.pack(side="left", padx=10)
+        self.btn_tbl_next = btn(pager, "下一页", lambda: self._tbl_goto(self._tbl_page + 1),
+                                8, font=F_SMALL)
+        self.btn_tbl_next.pack(side="left")
+        self.l_tbl_count = tk.Label(pager, text="", bg=UI["card"],
+                                    fg=UI["text_hint"], font=F_SMALL)
+        self.l_tbl_count.pack(side="right")
+        self._tbl_stamp = None
+        self._tbl_recs: list = []
+        self._tbl_page = 0
 
         self._draw_empty()
 
@@ -1985,12 +2064,180 @@ class HainnuGUI(tk.Tk):
 
     # ---------------------------------------------------------------- 流量图表
 
+    def _paint_window_chips(self) -> None:
+        """重画时间窗分段块的选中态（飞书式：选中主色实底白字）。"""
+        cur = self.var_win.get()
+        for name, chip in self._win_chips.items():
+            if name == cur:
+                chip.config(bg=UI["primary"], fg="#FFFFFF",
+                            highlightbackground=UI["primary"])
+            else:
+                chip.config(bg=UI["card"], fg=UI["text_regular"],
+                            highlightbackground=UI["border"])
+
+    def _hover_window(self, name: str, on: bool) -> None:
+        """未选中的块悬停时给一层浅灰底，选中块不响应悬停。"""
+        if name == self.var_win.get():
+            return
+        self._win_chips[name].config(bg=UI["hover"] if on else UI["card"])
+
+    def _set_window(self, name: str) -> None:
+        """点选时间窗：更新变量、重画分段块、刷新曲线/表格。"""
+        self.var_win.set(name)
+        self._paint_window_chips()
+        self._on_window()
+
     def _on_window(self):
         for name, sec, nb in WINDOWS:
             if self.var_win.get() == name:
                 self._window = (sec, nb)
                 break
+        self._tbl_stamp = None
         self._refresh_usage()
+
+    def _paint_switch(self) -> None:
+        """飞书式滑动开关：关=曲线，开=表格。"""
+        c = self._sw
+        c.delete("all")
+        on = self.var_view.get() == "table"
+        track = UI["primary"] if on else UI["border"]
+        c.create_oval(1, 1, 21, 21, fill=track, outline="")
+        c.create_oval(19, 1, 39, 21, fill=track, outline="")
+        c.create_rectangle(11, 1, 29, 21, fill=track, outline="")
+        kx = 20 if on else 2
+        c.create_oval(kx, 2, kx + 18, 20, fill="#FFFFFF", outline="")
+        self.l_view_chart.config(fg=UI["text_main"] if not on else UI["text_hint"])
+        self.l_view_table.config(fg=UI["text_main"] if on else UI["text_hint"])
+
+    def _set_usage_view(self, view: str) -> None:
+        """标题行右侧开关：曲线 ↔ 表格。时间窗筛选两边共用。"""
+        if view not in ("chart", "table"):
+            return
+        self.var_view.set(view)
+        self._paint_switch()
+        if view == "chart":
+            self.tbl_frame.pack_forget()
+            self.canvas.pack(fill="both", expand=True, pady=(4, 0))
+            self.update_idletasks()
+            self._refresh_usage()
+        else:
+            self.canvas.pack_forget()
+            self.tbl_frame.pack(fill="both", expand=True, pady=(4, 0))
+            self._tbl_stamp = None
+            self._fill_usage_table()
+
+    def _load_ds_icon(self):
+        """DeepSeek 系列模型的 18px 鲸鱼图标；Pillow 不可用或文件缺失则不用。"""
+        p = BASE / "deepseek.png"
+        if not p.exists():
+            return None
+        try:
+            from PIL import Image, ImageTk
+            im = Image.open(p)
+            self._ico_ds_ref = ImageTk.PhotoImage(im)
+            return self._ico_ds_ref
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _row_cost(self, rec: dict) -> str:
+        p = self.price or dict(FLASH_PRICE_FALLBACK)
+        peak = beijing_peak(rec.get("ts"))
+        hp = (p["in_hit_peak"] if peak else p["in_hit_off"]) / 1e6
+        mp = (p["in_miss_peak"] if peak else p["in_miss_off"]) / 1e6
+        out_p = (p["out_peak"] if peak else p["out_off"]) / 1e6
+        pin = int(rec.get("prompt") or 0)
+        pout = int(rec.get("completion") or 0)
+        ch = rec.get("cache_hit")
+        if ch is None:
+            ratio = CACHE_HIT_RATIO_DEFAULT
+            yuan = pin * (ratio * hp + (1 - ratio) * mp) + pout * out_p
+        else:
+            ch = int(ch or 0)
+            cm = int(rec.get("cache_miss") or 0)
+            if ch + cm <= 0:
+                cm = pin
+            yuan = ch * hp + cm * mp + pout * out_p
+        return f"¥{yuan:.4f}" if yuan < 0.01 else f"¥{yuan:.2f}"
+
+    def _tbl_pages(self) -> int:
+        return max(1, (len(self._tbl_recs) + TABLE_PAGE - 1) // TABLE_PAGE)
+
+    def _tbl_goto(self, page: int) -> None:
+        self._tbl_page = max(0, min(int(page), self._tbl_pages() - 1))
+        self._render_usage_page()
+
+    def _fill_usage_table(self) -> None:
+        """加载当前时间窗记录；翻页只重画当前 50 条。"""
+        sec = self._window[0]
+        cutoff = calendar_anchor(sec)
+        if cutoff is None:
+            cutoff = time.time() - sec
+        try:
+            st = USAGE_LOG.stat()
+            stamp = (st.st_mtime, st.st_size, cutoff)
+        except Exception:  # noqa: BLE001
+            stamp = None
+        if stamp is not None and stamp == self._tbl_stamp:
+            return
+        self._tbl_stamp = stamp
+        recs = []
+        if stamp is not None:
+            try:
+                with open(USAGE_LOG, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if (rec.get("ts") or 0) >= cutoff:
+                            recs.append(rec)
+            except Exception:  # noqa: BLE001
+                recs = []
+        recs.reverse()
+        self._tbl_recs = recs
+        self._tbl_page = 0
+        self._render_usage_page()
+
+    def _render_usage_page(self) -> None:
+        tree = self.usage_tree
+        tree.delete(*tree.get_children())
+        recs = self._tbl_recs
+        pages = self._tbl_pages()
+        page = max(0, min(self._tbl_page, pages - 1))
+        self._tbl_page = page
+        start = page * TABLE_PAGE
+        chunk = recs[start:start + TABLE_PAGE]
+        ico = self._ico_ds
+        for rec in chunk:
+            ts = rec.get("ts") or 0
+            prompt = int(rec.get("prompt") or 0)
+            completion = int(rec.get("completion") or 0)
+            hit, miss = rec.get("cache_hit"), rec.get("cache_miss")
+            if hit is None and miss is None:
+                cache_s, rate_s = "—", "—"
+            else:
+                hit = int(hit or 0)
+                den = hit + int(miss or 0)
+                cache_s = f"{hit:,}"
+                rate_s = f"{hit / den * 100:.1f}%" if den else "—"
+            ms = rec.get("ms")
+            ms_s = f"{float(ms) / 1000:.2f}s" if ms is not None else "—"
+            model = str(rec.get("model") or "—")
+            kw = {}
+            if ico is not None and "deepseek" in model.lower():
+                kw["image"] = ico
+            tree.insert("", "end", text=model, values=(
+                time.strftime("%m-%d %H:%M:%S", time.localtime(ts)),
+                rec.get("effort") or "—",
+                f"{prompt:,} / {cache_s} / {completion:,}",
+                ms_s, self._row_cost(rec), rate_s), **kw)
+        self.l_tbl_page.config(text=f"第 {page + 1} / {pages} 页")
+        self.l_tbl_count.config(text=f"共 {len(recs)} 条 · 每页 {TABLE_PAGE}")
+        self.btn_tbl_prev.config(state=("disabled" if page <= 0 else "normal"))
+        self.btn_tbl_next.config(state=("disabled" if page >= pages - 1 else "normal"))
 
     @staticmethod
     def _avg_unit_sec(sec: int) -> int:
@@ -2065,7 +2312,10 @@ class HainnuGUI(tk.Tk):
         else:
             self.l_cache.config(text="—")
             self.l_cache_sub.config(text="暂无缓存信息（重启代理后记录）")
-        self._draw_line(bins, bout, brate, (hit_t, miss_t))
+        if self.var_view.get() == "table":
+            self._fill_usage_table()
+        else:
+            self._draw_line(bins, bout, brate, (hit_t, miss_t))
         self._update_savings()
         self._refresh_price_label()
 

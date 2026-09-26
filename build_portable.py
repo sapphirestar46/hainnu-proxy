@@ -56,6 +56,7 @@ FILES = [
     # 核心代码
     "hainnu_proxy.py",
     "hainnu_gui.py",
+    "deepseek.png",              # 用量表 DeepSeek 模型图标
     "_port_guard.py",            # 2.启动代理.bat / 6.关闭代理.bat 的依赖（虽然带下划线，但是功能件）
     "_deps_check.py",            # 2.启动代理.bat / 管理台启动代理前的依赖自检与自动安装；只用标准库，缺依赖时也能跑
     "anthropic_compat.py",

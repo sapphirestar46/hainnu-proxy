@@ -123,29 +123,42 @@ def _cache_from_usage(u: dict) -> tuple[int | None, int | None]:
     return hit, int(miss or 0)
 
 
-def record_usage_from(data: dict, key: str = "") -> None:
-    u = data.get("usage") or {}
-    hit, miss = _cache_from_usage(u)
-    record_usage(u.get("prompt_tokens"), u.get("completion_tokens"), key=key,
-                 cache_hit=hit, cache_miss=miss)
-
-
-def record_usage(prompt, completion, key: str = "",
-                 cache_hit: int | None = None, cache_miss: int | None = None) -> None:
-    try:
-        prompt = int(prompt or 0)
-        completion = int(completion or 0)
-        rec = {"ts": time.time(), "prompt": prompt, "completion": completion,
-               "total": prompt + completion, "key": key}
-        # 缓存命中：**上游给了才写**。老记录没有这两个字段 → 统计时按「无信息」跳过，
-        # 不会被当成 0% 命中（详见 _cache_series）。
-        if cache_hit is not None or cache_miss is not None:
-            rec["cache_hit"] = int(cache_hit or 0)
-            rec["cache_miss"] = int(cache_miss or 0)
-        with open(USAGE_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:  # noqa: BLE001
-        pass
+def record_usage_from(data: dict, key: str = "", model: str = "",
+                      effort: str = "", ms: float | None = None,
+                      stream: bool | None = None) -> None:
+    u = data.get("usage") or {}
+    hit, miss = _cache_from_usage(u)
+    record_usage(u.get("prompt_tokens"), u.get("completion_tokens"), key=key,
+                 cache_hit=hit, cache_miss=miss, model=model, effort=effort,
+                 ms=ms, stream=stream)
+
+
+def record_usage(prompt, completion, key: str = "",
+                 cache_hit: int | None = None, cache_miss: int | None = None,
+                 model: str = "", effort: str = "",
+                 ms: float | None = None, stream: bool | None = None) -> None:
+    try:
+        prompt = int(prompt or 0)
+        completion = int(completion or 0)
+        rec = {"ts": time.time(), "prompt": prompt, "completion": completion,
+               "total": prompt + completion, "key": key}
+        # 缓存命中：**上游给了才写**。老记录没有这两个字段 → 统计时按「无信息」跳过，
+        # 不会被当成 0% 命中（详见 _cache_series）。
+        if cache_hit is not None or cache_miss is not None:
+            rec["cache_hit"] = int(cache_hit or 0)
+            rec["cache_miss"] = int(cache_miss or 0)
+        if model:
+            rec["model"] = str(model)
+        if effort:
+            rec["effort"] = str(effort)
+        if ms is not None:
+            rec["ms"] = round(float(ms), 1)
+        if stream is not None:
+            rec["stream"] = bool(stream)
+        with open(USAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 # ----------------------------------------------------------------------------
 # 本地自我保护：固定窗口限流 / 并发上限 / 按 Key 配额 / 用量统计
@@ -1136,10 +1149,12 @@ async def _chat_impl(request: Request, key_id: str):
                 {"error": {"message": "上游返回的不是 JSON", "body": r.text[:800]}},
                 status_code=502,
             )
-        data = clean_response_json(data)
-        ensure_content(data)
-        record_usage_from(data, key_id)
-        LOG.info("openai chat ok %.1fs", time.time() - _t0)
+        data = clean_response_json(data)
+        ensure_content(data)
+        record_usage_from(data, key_id, model=str(body.get("model") or ""),
+                          effort=str(body.get("reasoning_effort") or ""),
+                          ms=(time.time() - _t0) * 1000, stream=False)
+        LOG.info("openai chat ok %.1fs", time.time() - _t0)
         return JSONResponse(data)
 
     do_clean = bool(CFG.get("clean_think_tags", True))
@@ -1291,9 +1306,11 @@ async def _chat_impl(request: Request, key_id: str):
         并且这里**绝不 yield**（见 gen() 里 GeneratorExit 分支的说明）。
         """
         try:
-            if last_usage:
-                record_usage_from(last_usage)
-                _out_end((last_usage.get("usage") or {}).get("completion_tokens") or 0)
+            if last_usage:
+                record_usage_from(last_usage, model=str(body.get("model") or ""),
+                                  effort=str(body.get("reasoning_effort") or ""),
+                                  ms=(time.time() - _t0) * 1000, stream=True)
+                _out_end((last_usage.get("usage") or {}).get("completion_tokens") or 0)
             else:
                 _out_end()
         except Exception:  # noqa: BLE001
@@ -1497,8 +1514,10 @@ async def anthropic_messages(request: Request):
             data = clean_response_json(r.json())
         except Exception:  # noqa: BLE001
             return _anth_error("上游返回的不是 JSON", 502)
-        record_usage_from(data)
-        LOG.info("anthropic messages ok %.1fs", time.time() - _t0)
+        record_usage_from(data, model=str(model_name or ""),
+                          effort=str(oai_body.get("reasoning_effort") or ""),
+                          ms=(time.time() - _t0) * 1000, stream=False)
+        LOG.info("anthropic messages ok %.1fs", time.time() - _t0)
         return JSONResponse(
             anthropic_compat.to_anthropic_response(data, model_name, emit_thinking)
         )
@@ -1514,8 +1533,10 @@ async def anthropic_messages(request: Request):
     def anth_finalize() -> None:
         """收尾：统计用量 + 生成 message_stop 帧。只放在 finally 里、本身不 yield。"""
         try:
-            if last_usage:
-                record_usage_from(last_usage)
+            if last_usage:
+                record_usage_from(last_usage, model=str(model_name or ""),
+                                  effort=str(oai_body.get("reasoning_effort") or ""),
+                                  ms=(time.time() - _t0) * 1000, stream=True)
         except Exception:  # noqa: BLE001
             LOG.exception("anthropic finalize: 用量统计失败")
         try:

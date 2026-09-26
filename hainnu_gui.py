@@ -72,8 +72,8 @@ OR_FLASH_IDS = (
     "deepseek/deepseek-v4-flash",
     "deepseek/deepseek-v4-flash-latest",
 )
-# 价格缓存多久算「还新鲜」（秒）。官方价格几个月才动一次，没必要每次点都爬。
-PRICE_TTL = 12 * 3600
+# 官方价自动获取：每天首次启动 GUI 时后台拉一次（见 _maybe_auto_update_price）。
+# 官方价格几个月才动一次，没必要每次启动/每次点都爬。
 # ⚠️ 现版本：桥会把上游的 prompt_cache_hit_tokens/miss 落盘，**省钱统计与实际命中率都改用实测值**；
 CACHE_HIT_RATIO_DEFAULT = 0.97
 
@@ -157,7 +157,7 @@ def _has_proxy_deps(py: Path) -> bool:
     try:
         r = subprocess.run(
             [str(py), "-c", "import fastapi,uvicorn,httpx"],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW,
         )
         return r.returncode == 0
     except Exception:  # noqa: BLE001
@@ -178,7 +178,8 @@ def any_python() -> Path | None:
         try:
             if c.exists() and subprocess.run([str(c), "-c", "pass"],
                                              capture_output=True,
-                                             timeout=30).returncode == 0:
+                                             timeout=30,
+                                             creationflags=CREATE_NO_WINDOW).returncode == 0:
                 return c
         except Exception:  # noqa: BLE001
             continue
@@ -199,7 +200,8 @@ def deps_check_python() -> Path | None:
         r = subprocess.run(
             [str(host), str(BASE / "_deps_check.py"), "--print-python"],
             cwd=str(BASE), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=180)
+            encoding="utf-8", errors="replace", timeout=180,
+            creationflags=CREATE_NO_WINDOW)
         for line in (r.stdout or "").splitlines():
             if line.startswith("PY="):
                 cand = Path(line[3:].strip())
@@ -761,7 +763,7 @@ def ensure_pillow() -> bool:
             subprocess.run(
                 [str(py), "-m", "pip", "install", "-q",
                  "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", "Pillow"],
-                capture_output=True, timeout=120)
+                capture_output=True, timeout=120, creationflags=CREATE_NO_WINDOW)
             import PIL  # noqa: F401
             _PILLOW_OK = True
         except Exception:  # noqa: BLE001
@@ -902,7 +904,8 @@ def listener_pids(port: int) -> set[int]:
     pids: set[int] = set()
     try:
         out = subprocess.run("netstat -ano", capture_output=True, text=True,
-                             errors="replace").stdout or ""
+                             errors="replace",
+                             creationflags=CREATE_NO_WINDOW).stdout or ""
     except Exception:  # noqa: BLE001
         return pids
     for line in out.splitlines():
@@ -945,7 +948,8 @@ def stop_proxy_processes(port: int | None = None) -> int:
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
     )
     try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW)
     except Exception:  # noqa: BLE001
         pass
     return -1                       # 全杀模式没法可靠计数
@@ -1340,13 +1344,20 @@ class HainnuGUI(tk.Tk):
         row = tk.Frame(use_body, bg=UI["card"])
         row.pack(fill="x")
         self.var_win = tk.StringVar(value="24小时")
+        # 时间窗选择：飞书式方形分段块（选中=主色实底白字，未选=白底灰字细边），
+        # 取代 Windows 原生圆形单选钮。
+        winbar = tk.Frame(row, bg=UI["card"])
+        winbar.pack(side="left")
+        self._win_chips = {}
         for name, _sec, _nb in WINDOWS:
-            tk.Radiobutton(row, text=name, variable=self.var_win, value=name,
-                           command=self._on_window, font=F_BODY,
-                           bg=UI["card"], fg=UI["text_regular"],
-                           activebackground=UI["card"], activeforeground=UI["text_main"],
-                           selectcolor="#FFFFFF", highlightthickness=0,
-                           cursor="hand2").pack(side="left")
+            chip = tk.Label(winbar, text=name, font=F_SMALL, cursor="hand2",
+                            bd=0, highlightthickness=1, padx=10, pady=3)
+            chip.pack(side="left", padx=(0, 4))
+            chip.bind("<Button-1>", lambda _e, n=name: self._set_window(n))
+            chip.bind("<Enter>", lambda _e, n=name: self._hover_window(n, True))
+            chip.bind("<Leave>", lambda _e, n=name: self._hover_window(n, False))
+            self._win_chips[name] = chip
+        self._paint_window_chips()
         self.l_sum = tk.Label(row, text="总计 — · 请求 —", font=F_BODY,
                               bg=UI["card"], fg=UI["text_secondary"])
         self.l_sum.pack(side="right")
@@ -1811,7 +1822,8 @@ class HainnuGUI(tk.Tk):
                 r = subprocess.run(
                     [str(host), str(BASE / "_deps_check.py"), "--install"],
                     cwd=str(BASE), capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=900)
+                    encoding="utf-8", errors="replace", timeout=900,
+                    creationflags=CREATE_NO_WINDOW)
             except Exception as exc:  # noqa: BLE001
                 self.q.put(("status_err", f"依赖安装失败：{exc}"))
                 return
@@ -1993,7 +2005,8 @@ class HainnuGUI(tk.Tk):
         try:
             r = subprocess.run([str(py), str(BASE / "autostart.py"), "--status"],
                                cwd=str(BASE), capture_output=True, text=True,
-                               encoding="utf-8", errors="replace")
+                               encoding="utf-8", errors="replace",
+                               creationflags=CREATE_NO_WINDOW)
             out = (r.stdout or "") + (r.stderr or "")
             label = "已设开机自启" if ("已设置" in out) else "启用开机自启"
             self.after_idle(lambda: self.btn_auto.config(text=label))
@@ -2011,13 +2024,15 @@ class HainnuGUI(tk.Tk):
             try:
                 r = subprocess.run([str(py), str(BASE / "autostart.py"), "--status"],
                                    cwd=str(BASE), capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace")
+                                   encoding="utf-8", errors="replace",
+                                   creationflags=CREATE_NO_WINDOW)
                 out = (r.stdout or "") + (r.stderr or "")
                 installed = ("已设置" in out)
                 arg = "--uninstall" if installed else "--install"
                 r2 = subprocess.run([str(py), str(BASE / "autostart.py"), arg],
                                     cwd=str(BASE), capture_output=True, text=True,
-                                    encoding="utf-8", errors="replace")
+                                    encoding="utf-8", errors="replace",
+                                    creationflags=CREATE_NO_WINDOW)
                 done = (r2.stdout or "") + (r2.stderr or "")
                 # 开机自启按钮文案：设置后→“已设开机自启”；再次点击关闭→恢复“启用开机自启”
                 label = "启用开机自启" if installed else "已设开机自启"
@@ -2037,13 +2052,15 @@ class HainnuGUI(tk.Tk):
 
         def work():
             check = subprocess.run([str(py), "-c", "import playwright"],
-                                   cwd=str(BASE), capture_output=True)
+                                   cwd=str(BASE), capture_output=True,
+                                   creationflags=CREATE_NO_WINDOW)
             if check.returncode != 0:
                 self.q.put(("status", "首次使用令牌工具，正在按需安装 playwright（约110MB）…"))
                 inst = subprocess.run(
                     [str(py), "-m", "pip", "install", "-q",
                      "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", "playwright"],
-                    cwd=str(BASE), capture_output=True)
+                    cwd=str(BASE), capture_output=True,
+                    creationflags=CREATE_NO_WINDOW)
                 if inst.returncode != 0:
                     tail = (inst.stderr or inst.stdout or b"").decode("utf-8", "replace")[-200:]
                     self.q.put(("status_err", f"playwright 安装失败：{tail}"))
@@ -2773,11 +2790,17 @@ class HainnuGUI(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _maybe_auto_update_price(self):
-        """启动时若价格已过期（默认 >12h），后台静默拉一次。
+        """每天**首次**启动 GUI 时后台静默拉一次官方价。
 
-        官方价格几个月才动一次，没必要每次开 GUI 都爬，但也不能让它一直停在旧值。
+        按北京日历日判断：上次成功获取不是「今天」就拉；同一天内重复开关 GUI
+        不再拉（官方价格几个月才动一次，没必要每次启动都爬）。失败则保持原值，
+        下次启动仍会重试。
         """
-        if time.time() - self.price_fetched_at < PRICE_TTL:
+        today = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+        last = (time.strftime("%Y-%m-%d",
+                              time.gmtime(self.price_fetched_at + 8 * 3600))
+                if self.price_fetched_at else "")
+        if last == today:
             return
         self._fetch_price_now(quiet=True)
 

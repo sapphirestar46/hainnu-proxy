@@ -30,6 +30,9 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 
+# 隐藏子进程控制台窗口（netstat / taskkill），批处理链路里也不额外弹黑框。
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 
 def load_port() -> int:
     try:
@@ -48,7 +51,8 @@ def listener_pids(port: int) -> set[int]:
     pids: set[int] = set()
     try:
         out = subprocess.run("netstat -ano", capture_output=True, text=True,
-                             errors="replace").stdout or ""
+                             errors="replace",
+                             creationflags=CREATE_NO_WINDOW).stdout or ""
     except Exception:  # noqa: BLE001
         return pids
     for line in out.splitlines():
@@ -103,7 +107,8 @@ def cmd_free(port: int) -> int:
     for pid in pids:
         try:
             subprocess.run(["taskkill", "/f", "/pid", str(pid)],
-                           capture_output=True, text=True, errors="replace")
+                           capture_output=True, text=True, errors="replace",
+                           creationflags=CREATE_NO_WINDOW)
             print(f"  已结束监听 {port} 的进程 PID={pid}")
         except Exception as exc:  # noqa: BLE001
             print(f"  结束 PID={pid} 失败：{exc}")

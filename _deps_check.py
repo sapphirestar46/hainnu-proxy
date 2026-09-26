@@ -53,6 +53,10 @@ OK, MISSING, INSTALL_FAILED, NO_PYTHON = 0, 10, 11, 12
 DEPS = ("fastapi", "uvicorn", "httpx")
 MAX_PROBE = 15          # 最多探这么多个解释器：conda 环境多时别把人等老
 
+# 隐藏子进程控制台窗口：管理台（无控制台的窗口进程）会在启动/起代理前调用本脚本，
+# 若内部的探测/pip 子进程不隐藏，用户就会看到一闪而过的黑框。
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 
 def log(msg: str) -> None:
     """给人看的一律走 stderr，别污染 stdout 的 PY= 行。"""
@@ -79,7 +83,8 @@ def _py_launcher_pythons() -> list[Path]:
         return []
     try:
         r = subprocess.run([exe, "-0p"], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=30)
+                           encoding="utf-8", errors="replace", timeout=30,
+                           creationflags=CREATE_NO_WINDOW)
     except Exception:  # noqa: BLE001
         return []
     out = []
@@ -158,6 +163,7 @@ def has_deps(py: Path) -> bool:
         return subprocess.run(
             [str(py), "-c", "import " + ",".join(DEPS)],
             capture_output=True, timeout=30,
+            creationflags=CREATE_NO_WINDOW,
         ).returncode == 0
     except Exception:  # noqa: BLE001
         return False
@@ -199,7 +205,8 @@ def dep_hits(py: Path) -> int:
             "if importlib.util.find_spec(m) is not None))")
     try:
         r = subprocess.run([str(py), "-c", code, *DEPS],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=60,
+                           creationflags=CREATE_NO_WINDOW)
         return int((r.stdout or "0").strip().splitlines()[0])
     except Exception:  # noqa: BLE001
         return 0
@@ -220,7 +227,8 @@ def pick_base() -> tuple[Path | None, int]:
             if not py.exists():
                 continue
             if subprocess.run([str(py), "-c", "pass"],
-                              capture_output=True, timeout=30).returncode != 0:
+                              capture_output=True, timeout=30,
+                              creationflags=CREATE_NO_WINDOW).returncode != 0:
                 continue
         except Exception:  # noqa: BLE001
             continue
@@ -244,7 +252,8 @@ def system_python() -> Path | None:
     for c in cands:
         try:
             if c.exists() and subprocess.run(
-                [str(c), "-c", "pass"], capture_output=True, timeout=30
+                [str(c), "-c", "pass"], capture_output=True, timeout=30,
+                creationflags=CREATE_NO_WINDOW,
             ).returncode == 0:
                 return c
         except Exception:  # noqa: BLE001
@@ -261,9 +270,11 @@ def run(cmd: list[str], timeout: int = 900, live: bool = False,
     """
     if live:
         return subprocess.run(cmd, timeout=timeout,
-                              stdout=(sys.stderr if to_stderr else None))
+                              stdout=(sys.stderr if to_stderr else None),
+                              creationflags=CREATE_NO_WINDOW)
     return subprocess.run(cmd, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+                          encoding="utf-8", errors="replace", timeout=timeout,
+                          creationflags=CREATE_NO_WINDOW)
 
 
 def install() -> int:

@@ -46,8 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "gpt-4o": "",
         "gpt-4o-mini": "",
     },
-    "clean_think_tags": True,   # 清洗 content 里残留的 <think> 标签
-    "upstream_retries": 4,      # 上游快速失败时的重试次数（学校后端偶发抽风/限流）
+    "upstream_retries": 4,      # 上游快速失败时的重试次数（学校后端偶发抽风/限流）
     "rate_limit_cooldown": 12,  # 撞到上游 429 后，全局冷却秒数（让并发请求错峰）
     "timeout": 300,
     "verify_ssl": True,
@@ -125,18 +124,20 @@ def _cache_from_usage(u: dict) -> tuple[int | None, int | None]:
 
 def record_usage_from(data: dict, key: str = "", model: str = "",
                       effort: str = "", ms: float | None = None,
-                      stream: bool | None = None) -> None:
+                      stream: bool | None = None,
+                      ttft_ms: float | None = None) -> None:
     u = data.get("usage") or {}
     hit, miss = _cache_from_usage(u)
     record_usage(u.get("prompt_tokens"), u.get("completion_tokens"), key=key,
                  cache_hit=hit, cache_miss=miss, model=model, effort=effort,
-                 ms=ms, stream=stream)
+                 ms=ms, stream=stream, ttft_ms=ttft_ms)
 
 
 def record_usage(prompt, completion, key: str = "",
                  cache_hit: int | None = None, cache_miss: int | None = None,
                  model: str = "", effort: str = "",
-                 ms: float | None = None, stream: bool | None = None) -> None:
+                 ms: float | None = None, stream: bool | None = None,
+                 ttft_ms: float | None = None) -> None:
     try:
         prompt = int(prompt or 0)
         completion = int(completion or 0)
@@ -153,6 +154,8 @@ def record_usage(prompt, completion, key: str = "",
             rec["effort"] = str(effort)
         if ms is not None:
             rec["ms"] = round(float(ms), 1)
+        if ttft_ms is not None:
+            rec["ttft_ms"] = round(float(ttft_ms), 1)
         if stream is not None:
             rec["stream"] = bool(stream)
         with open(USAGE_LOG, "a", encoding="utf-8") as f:
@@ -594,68 +597,13 @@ def resolve_model(req_model: str) -> str:
         return fallback
 
     # 上游列表也拉不到：原样转发，让上游自己报错，别静默改成别的东西
-    return req_model
-
-# ----------------------------------------------------------------------------
-# 思维链残留清洗
-# ----------------------------------------------------------------------------
-THINK_CLOSE = "</think>"
-THINK_OPEN = "<think>"
-
-
-class ThinkCleaner:
-    """流式清洗：开头先暂留一小段，确认没有 think 残留后再放行。
-
-    铁律：宁可不洗，也绝不能把正文洗成空字符串 ——
-    否则客户端会报 “completed response with no content”。
-    """
-
-    def __init__(self, hold: int = 512):
-        self.hold = hold
-        self.buf = ""
-        self.locked = False
-
-    def feed(self, text: str) -> str:
-        if self.locked:
-            return text.replace(THINK_CLOSE, "").replace(THINK_OPEN, "")
-        self.buf += text
-        if THINK_CLOSE in self.buf:
-            rest = self.buf[self.buf.rfind(THINK_CLOSE) + len(THINK_CLOSE):]
-            # 只有 </think> 后面真有内容才切；否则保留原文、仅去掉标签
-            self.buf = rest if rest.strip() else self.buf.replace(THINK_CLOSE, "")
-            self.locked = True
-            out, self.buf = self.buf, ""
-            return out
-        if len(self.buf) >= self.hold:
-            out, self.buf = self.buf, ""
-            self.locked = True
-            return out
-        return ""
-
-    def finish(self) -> str:
-        out = self.buf
-        if THINK_CLOSE in out:
-            rest = out[out.rfind(THINK_CLOSE) + len(THINK_CLOSE):]
-            out = rest if rest.strip() else out.replace(THINK_CLOSE, "")
-        out = out.replace(THINK_OPEN, "")
-        self.buf = ""
-        self.locked = True
-        return out
-
-
-def clean_text(text: str) -> str:
-    """非流式清洗：丢掉最后一个 </think> 及其之前的内容。
-
-    若切完为空（说明整段都只是思维链残留），则只去标签、保留原文，
-    绝不返回空串。
-    """
-    if THINK_CLOSE in text:
-        rest = text[text.rfind(THINK_CLOSE) + len(THINK_CLOSE):]
-        text = rest if rest.strip() else text.replace(THINK_CLOSE, "")
-    return text.replace(THINK_OPEN, "")
-
-
-def normalize_request(body: dict) -> dict:
+    return req_model
+
+# ----------------------------------------------------------------------------
+# 请求归一化
+# ----------------------------------------------------------------------------
+
+def normalize_request(body: dict) -> dict:
     """把各家客户端的写法翻译成上游认得的 OpenAI 形状。
 
     主要处理 DSH / pi-ai 这类客户端的两个已知差异：
@@ -868,18 +816,44 @@ def wait_rate_cooldown() -> None:
         _RATE_COOLDOWN["hits"] = 0
         _RATE_COOLDOWN["first_ts"] = 0.0
         return
-    if delay > 0:
-        LOG.warning("限流冷却等待 %.1fs（%s 放行）",
-                    time.strftime("%H:%M:%S", time.localtime(_RATE_COOLDOWN["until"])))
-        time.sleep(delay + random.uniform(0, 1.5))
-
-
-def backoff(attempt: int) -> float:
-    """指数退避 + 抖动，避免多个并发请求同时重试又撞在一起。总时长严格上限 30s（含抖动）。"""
-    d = min(1.5 * (2 ** attempt), 30.0)
-    return min(d + random.uniform(0, 0.8), 30.0)
-    LOG.warning("退避重试 attempt=%d delay=%.2fs", attempt + 1, d)
-    return d
+    if delay > 0:
+        LOG.warning("限流冷却等待 %.1fs（%s 放行）",
+                    delay,
+                    time.strftime("%H:%M:%S", time.localtime(_RATE_COOLDOWN["until"])))
+        time.sleep(delay + random.uniform(0, 1.5))
+
+
+def backoff(attempt: int) -> float:
+    """指数退避 + 抖动，避免多个并发请求同时重试又撞在一起。总时长严格上限 30s（含抖动）。"""
+    d = min(1.5 * (2 ** attempt), 30.0)
+    wait = min(d + random.uniform(0, 0.8), 30.0)
+    LOG.warning("退避重试 attempt=%d delay=%.2fs", attempt + 1, wait)
+    return wait
+
+
+def remap_model_after_not_found(payload: dict, text: str, req_model: str = "") -> bool:
+    """上游回 "Model not found" 时自愈：刷新模型列表 → 重新解析 → 允许重试一轮。
+
+    学校换模型 id 后，桥最多还会拿着 5 分钟内拉到的旧列表；这一层让改名生效后的
+    第一个请求自己接上，不用人工改配置、也不用重启代理。
+    优先拿客户端原始名字对新列表再解析一次，解析不出才退回默认/上游首个。
+    """
+    if "model not found" not in (text or "").lower():
+        return False
+    fresh = fetch_models(force=True)
+    if not fresh:
+        return False
+    new = resolve_model(req_model) if req_model else ""
+    if not new or new == payload.get("model"):
+        new = resolve_model("")
+    if new and new != payload.get("model"):
+        LOG.warning(
+            "模型 %r 上游已不存在，刷新后列表为 %s，自动改走 %r",
+            payload.get("model"), fresh, new,
+        )
+        payload["model"] = new
+        return True
+    return False
 
 
 @app.get("/health")
@@ -1090,38 +1064,9 @@ async def _chat_impl(request: Request, key_id: str):
             status_code=status,
         )
 
-    attempts = max(1, int(CFG.get("upstream_retries", 4)))
-
-    def retryable(status: int, text: str = "") -> bool:
-        """学校后端偶发抽风/限流时值得重试。
-        注意：上游限流常被包装成 HTTP 400（正文里带 429），必须连正文一起判断。"""
-        return is_rate_limited(status, text)
-
-    def remap_model_after_not_found(payload: dict, text: str) -> bool:
-        """上游回 "Model not found" 时自愈：刷新模型列表 → 重新解析 → 允许重试一轮。
-
-        学校换模型 id 后，桥最多还会拿着 5 分钟内拉到的旧列表；这一层让改名生效后的
-        第一个请求自己接上，不用人工改配置、也不用重启代理。
-        优先拿客户端原始名字对新列表再解析一次，解析不出才退回默认/上游首个。
-        """
-        if "model not found" not in (text or "").lower():
-            return False
-        fresh = fetch_models(force=True)
-        if not fresh:
-            return False
-        new = resolve_model(_req_model) if _req_model else ""
-        if not new or new == payload.get("model"):
-            new = resolve_model("")
-        if new and new != payload.get("model"):
-            LOG.warning(
-                "模型 %r 上游已不存在，刷新后列表为 %s，自动改走 %r",
-                payload.get("model"), fresh, new,
-            )
-            payload["model"] = new
-            return True
-        return False
-
-    if not want_stream:
+    attempts = max(1, int(CFG.get("upstream_retries", 4)))
+
+    if not want_stream:
         r = None
         for i in range(attempts):
             wait_rate_cooldown()
@@ -1133,10 +1078,10 @@ async def _chat_impl(request: Request, key_id: str):
                 "upstream chat %d (attempt %d/%d): %s",
                 r.status_code, i + 1, attempts, r.text[:200],
             )
-            note_rate_limited(r.status_code, r.text, "openai")
-            if i < attempts - 1 and remap_model_after_not_found(body, r.text):
-                continue
-            if i < attempts - 1 and retryable(r.status_code, r.text):
+            note_rate_limited(r.status_code, r.text, "openai")
+            if i < attempts - 1 and remap_model_after_not_found(body, r.text, _req_model):
+                continue
+            if i < attempts - 1 and is_rate_limited(r.status_code, r.text):
                 time.sleep(backoff(i))
                 continue
             return on_upstream_error(r.status_code, r.text)
@@ -1149,95 +1094,54 @@ async def _chat_impl(request: Request, key_id: str):
                 {"error": {"message": "上游返回的不是 JSON", "body": r.text[:800]}},
                 status_code=502,
             )
-        data = clean_response_json(data)
-        ensure_content(data)
         record_usage_from(data, key_id, model=str(body.get("model") or ""),
                           effort=str(body.get("reasoning_effort") or ""),
                           ms=(time.time() - _t0) * 1000, stream=False)
         LOG.info("openai chat ok %.1fs", time.time() - _t0)
         return JSONResponse(data)
 
-    do_clean = bool(CFG.get("clean_think_tags", True))
-    dbg_on = bool(CFG.get("debug_capture"))
-    raw_events: list[bytes] = []
-    cleaner = ThinkCleaner()
-    tail_obj: dict[str, Any] = {}
-    last_usage: dict[str, Any] = {}  # 最后一次带 usage 的事件（流读完统一记一次，避免逐 chunk 重复）
-    last_chunk: dict[str, Any] = {}  # 最后一个带 choices 的事件（flush 时用它当基底）
-    reasoning_buf: list[str] = []
-    emitted = {"content": False}
-
-    def process_event(ev: bytes) -> bytes:
-        """处理单个 SSE 事件：清洗 delta.content 中的 think 残留。"""
-        if not ev.startswith(b"data:"):
-            return ev
-        payload = ev[5:].strip()
-        if payload == b"[DONE]" or not payload:
-            return ev
-        try:
-            obj = json.loads(payload.decode("utf-8", "replace"))
-        except Exception:  # noqa: BLE001
-            return ev
-        tail_obj.clear()
-        tail_obj.update(obj)
-        if obj.get("choices"):
-            last_chunk.clear()
-            last_chunk.update(obj)
-        if obj.get("usage"):
-            last_usage.clear()
-            last_usage.update(obj)
-        for ch in obj.get("choices") or []:
-            d = ch.get("delta") or {}
-            rc = d.get("reasoning_content")
-            if isinstance(rc, str) and rc:
-                reasoning_buf.append(rc)
-            c = d.get("content")
-            if isinstance(c, str) and c:
-                if do_clean:
-                    c = cleaner.feed(c)
-                if c:
-                    emitted["content"] = True
-                    _out_add(c)   # 实时输出速度：按内容估算
-                d["content"] = c
-            if d.get("tool_calls"):
-                emitted["content"] = True
-        return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8")
-
-    def flush_tail() -> bytes:
-        """流结束时补发暂留内容；全程无正式正文就直接留空（有意的：思维链不走正文）。"""
-        if not tail_obj:
-            return b""
-        text = ""
-        if do_clean and not cleaner.locked:
-            text = cleaner.finish()
-        if not text:
-            return b""   # 全程无正式正文：不把思维链降级成正文，直接留空
-        base = last_chunk if last_chunk.get("choices") else (
-            tail_obj if tail_obj.get("choices") else None)
-        if base:
-            tail = json.loads(json.dumps(base))
-            for ch in tail.get("choices") or []:
-                d = ch.get("delta") or {}
-                d["content"] = text
-                d.pop("reasoning_content", None)
-        else:
-            tail = {
-                "id": "proxy-flush",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": CFG.get("default_model") or (MODEL_CACHE["ids"][0] if MODEL_CACHE["ids"] else ""),
-                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
-            }
-        return b"data: " + json.dumps(tail, ensure_ascii=False).encode("utf-8") + b"\n\n"
-
-    tail_flushed = {"v": False}
-    done_sent = {"v": False}
-
-    def flush_tail_once() -> bytes:
-        if tail_flushed["v"]:
-            return b""
-        tail_flushed["v"] = True
-        return flush_tail()
+    dbg_on = bool(CFG.get("debug_capture"))
+    raw_events: list[bytes] = []
+    last_usage: dict[str, Any] = {}  # 最后一次带 usage 的事件（流读完统一记一次，避免逐 chunk 重复）
+    reasoning_buf: list[str] = []
+    emitted = {"content": False}
+    ttft_ms = {"v": None}
+
+    def _mark_ttft() -> None:
+        if ttft_ms["v"] is None:
+            ttft_ms["v"] = (time.time() - _t0) * 1000
+
+    def process_event(ev: bytes) -> bytes:
+        """观察单个 SSE 事件：记用量、是否已出正文、输出速度。不改写事件。"""
+        if not ev.startswith(b"data:"):
+            return ev
+        payload = ev[5:].strip()
+        if payload == b"[DONE]" or not payload:
+            return ev
+        try:
+            obj = json.loads(payload.decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            return ev
+        if obj.get("usage"):
+            last_usage.clear()
+            last_usage.update(obj)
+        for ch in obj.get("choices") or []:
+            d = ch.get("delta") or {}
+            rc = d.get("reasoning_content")
+            if isinstance(rc, str) and rc:
+                reasoning_buf.append(rc)
+                _mark_ttft()
+            c = d.get("content")
+            if isinstance(c, str) and c:
+                emitted["content"] = True
+                _out_add(c)   # 实时输出速度：按内容估算
+                _mark_ttft()
+            if d.get("tool_calls"):
+                emitted["content"] = True
+                _mark_ttft()
+        return ev
+
+    done_sent = {"v": False}
 
     cli = client()
     r = None
@@ -1264,10 +1168,10 @@ async def _chat_impl(request: Request, key_id: str):
             "upstream stream %d (attempt %d/%d): %s",
             r.status_code, i + 1, attempts, text[:200],
         )
-        note_rate_limited(r.status_code, text, "anthropic")
-        if i < attempts - 1 and remap_model_after_not_found(body, text):
-            continue
-        if i < attempts - 1 and retryable(r.status_code, text):
+        note_rate_limited(r.status_code, text, "openai")
+        if i < attempts - 1 and remap_model_after_not_found(body, text, _req_model):
+            continue
+        if i < attempts - 1 and is_rate_limited(r.status_code, text):
             time.sleep(backoff(i))
             continue
         cli.close()
@@ -1280,21 +1184,18 @@ async def _chat_impl(request: Request, key_id: str):
     # 上游已确认 200，开始流式转发 -> 计时输出速度
     _out_start()
 
-    def emit(ev: bytes):
-        """产出单个事件；碰到上游 [DONE] 时，先把暂留正文吐出来再转发它。"""
-        if dbg_on:
-            raw_events.append(ev)
-        stripped = ev.strip()
-        if stripped.startswith(b"data:") and stripped[5:].strip() == b"[DONE]":
-            extra = flush_tail_once()
-            if extra:
-                yield extra
-            done_sent["v"] = True
-            yield stripped + b"\n\n"
-            return
-        out = process_event(ev)
-        if out:
-            yield out + b"\n\n" if not out.endswith(b"\n\n") else out
+    def emit(ev: bytes):
+        """产出单个事件。"""
+        if dbg_on:
+            raw_events.append(ev)
+        stripped = ev.strip()
+        if stripped.startswith(b"data:") and stripped[5:].strip() == b"[DONE]":
+            done_sent["v"] = True
+            yield stripped + b"\n\n"
+            return
+        out = process_event(ev)
+        if out:
+            yield out + b"\n\n" if not out.endswith(b"\n\n") else out
 
     # 流的状态。放在 gen() 外面，好让收尾函数也能读到（嵌套函数只能闭包外层的变量）。
     stream_state = {"finished": False, "aborted": False}
@@ -1309,7 +1210,8 @@ async def _chat_impl(request: Request, key_id: str):
             if last_usage:
                 record_usage_from(last_usage, model=str(body.get("model") or ""),
                                   effort=str(body.get("reasoning_effort") or ""),
-                                  ms=(time.time() - _t0) * 1000, stream=True)
+                                  ms=(time.time() - _t0) * 1000, stream=True,
+                                  ttft_ms=ttft_ms["v"])
                 _out_end((last_usage.get("usage") or {}).get("completion_tokens") or 0)
             else:
                 _out_end()
@@ -1370,21 +1272,18 @@ async def _chat_impl(request: Request, key_id: str):
                 msg = json.dumps({"error": {"message": f"上游连接失败: {exc}"}})
                 yield ("data: " + msg + "\n\n").encode()
             else:
-                # 已出部分内容：不注入 error，走下面的收尾补发暂留正文 + [DONE]，
-                # 客户端得到“已收到的内容 + 干净收尾”，会话不被限流中途掐断。
-                LOG.warning("upstream stream teardown 后已出内容，优雅收尾（不中断会话）")
-            stream_state["finished"] = True
-        finally:
-            finalize_stream()
-
-        # 正常读完 / 中途出错：补发暂留正文，再补 [DONE]。
-        # 客户端提前断开时走不到这里 —— 那种情况由上面的 GeneratorExit 分支处理。
-        if stream_state["finished"]:
-            extra = flush_tail_once()
-            if extra:
-                yield extra
-            if not done_sent["v"]:
-                yield b"data: [DONE]\n\n"
+                # 已出部分内容：不注入 error，走下面的收尾补 [DONE]，
+                # 客户端得到“已收到的内容 + 干净收尾”，会话不被限流中途掐断。
+                LOG.warning("upstream stream teardown 后已出内容，优雅收尾（不中断会话）")
+            stream_state["finished"] = True
+        finally:
+            finalize_stream()
+
+        # 正常读完 / 中途出错：补 [DONE]。
+        # 客户端提前断开时走不到这里 —— 那种情况由上面的 GeneratorExit 分支处理。
+        if stream_state["finished"]:
+            if not done_sent["v"]:
+                yield b"data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -1396,66 +1295,55 @@ async def reload(request: Request):
     global CFG
     CFG = load_config(CONFIG_PATH)
     ids = fetch_models(force=True)
-    return {"ok": True, "models": ids}
-
-
-def clean_response_json(data: dict) -> dict:
-    """非流式：清洗 message.content 里的 think 残留。"""
-    if not CFG.get("clean_think_tags", True):
-        return data
-    for ch in data.get("choices") or []:
-        msg = ch.get("message") or {}
-        c = msg.get("content")
-        if isinstance(c, str) and (THINK_CLOSE in c or THINK_OPEN in c):
-            msg["content"] = clean_text(c)
-    return data
-
-
-def ensure_content(data: dict) -> None:
-    """非流式：正文为空时不再把思维链降级为正文。
-    思考/推理不是正式回答（这是有意的行为：早期曾把思维链误放进正文，已专门修掉），
-    客户端不应把它当成正文；正文为空就保持空，思维链走 reasoning_content 通道。"""
-
-
-def _clean_event(ev: bytes, cleaner: "ThinkCleaner", tail_holder: dict) -> bytes:
-    """流式：清洗单个 SSE 事件里的 delta.content。"""
-    if not ev.startswith(b"data:"):
-        return ev
-    payload = ev[5:].strip()
-    if payload == b"[DONE]" or not payload:
-        return ev
-    try:
-        obj = json.loads(payload.decode("utf-8", "replace"))
-    except Exception:  # noqa: BLE001
-        return ev
-    tail_holder.clear()
-    tail_holder.update(obj)
-    for ch in obj.get("choices") or []:
-        d = ch.get("delta") or {}
-        c = d.get("content")
-        if isinstance(c, str) and c:
-            d["content"] = cleaner.feed(c)
-    return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8")
-
-
-def _upstream_sse_events(body: dict):
-    """按 SSE 事件边界（\\n\\n）产出上游返回的每个事件。"""
-    url = upstream("/api/chat/completions")
-    with client() as cli:
-        with cli.stream("POST", url, headers=fwd_headers(), json=body) as r:
-            if r.status_code != 200:
-                yield b"__ERROR__" + str(r.status_code).encode() + b":" + r.read()[:800]
-                return
-            buf = b""
-            for chunk in r.iter_bytes():
-                if not chunk:
-                    continue
-                buf += chunk
-                while b"\n\n" in buf:
-                    ev, buf = buf.split(b"\n\n", 1)
-                    yield ev
-            if buf.strip():
-                yield buf.strip()
+    return {"ok": True, "models": ids}
+
+
+def _upstream_sse_events(body: dict, req_model: str = ""):
+    """按 SSE 事件边界（\\n\\n）产出上游返回的每个事件。失败时按 OpenAI 路径同样重试。"""
+    url = upstream("/api/chat/completions")
+    attempts = max(1, int(CFG.get("upstream_retries", 4)))
+    last_err = b""
+    for i in range(attempts):
+        wait_rate_cooldown()
+        try:
+            with client() as cli:
+                with cli.stream("POST", url, headers=fwd_headers(), json=body) as r:
+                    status = r.status_code
+                    if status == 200:
+                        buf = b""
+                        for chunk in r.iter_bytes():
+                            if not chunk:
+                                continue
+                            buf += chunk
+                            while b"\n\n" in buf:
+                                ev, buf = buf.split(b"\n\n", 1)
+                                yield ev
+                        if buf.strip():
+                            yield buf.strip()
+                        return
+                    text = r.read().decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("upstream anthropic connect failed (attempt %d/%d): %s", i + 1, attempts, exc)
+            if i < attempts - 1:
+                time.sleep(1.0 * (i + 1))
+                continue
+            yield b"__ERROR__502:" + str(exc).encode("utf-8", "replace")[:800]
+            return
+        LOG.warning(
+            "upstream anthropic stream %d (attempt %d/%d): %s",
+            status, i + 1, attempts, text[:200],
+        )
+        note_rate_limited(status, text, "anthropic")
+        last_err = b"__ERROR__" + str(status).encode() + b":" + text.encode("utf-8", "replace")[:800]
+        if i < attempts - 1 and remap_model_after_not_found(body, text, req_model):
+            continue
+        if i < attempts - 1 and is_rate_limited(status, text):
+            time.sleep(backoff(i))
+            continue
+        yield last_err
+        return
+    if last_err:
+        yield last_err
 
 # ----------------------------------------------------------------------------
 # Anthropic Messages API 兼容层
@@ -1490,30 +1378,53 @@ async def anthropic_messages(request: Request):
     except Exception as exc:  # noqa: BLE001
         return _anth_error(f"请求转换失败: {exc}", 400)
 
-    oai_body = normalize_request(oai_body)
-    # 思考强度：与 OpenAI 路径同一套优先级（见 apply_reasoning_effort）
-    apply_reasoning_effort(request, oai_body)
-
-    model_name = oai_body.get("model", "")
-    emit_thinking = bool(CFG.get("anthropic_emit_thinking", False))
-    _t0 = time.time()
-    LOG.info(
-        "anthropic messages model=%s stream=%s tools=%d effort=%s",
-        model_name, bool(oai_body.get("stream")), len(oai_body.get("tools") or []),
-        oai_body.get("reasoning_effort") or "-",
-    )
-
-    if not oai_body.get("stream"):
-        with client() as cli:
-            r = cli.post(upstream("/api/chat/completions"), headers=fwd_headers(), json=oai_body)
-        if r.status_code != 200:
-            if r.status_code in (401, 403):
-                return _anth_error("学校登录令牌已失效，请重新运行 1.获取令牌.bat", r.status_code)
-            return _anth_error(r.text[:400], r.status_code)
-        try:
-            data = clean_response_json(r.json())
-        except Exception:  # noqa: BLE001
-            return _anth_error("上游返回的不是 JSON", 502)
+    oai_body = normalize_request(oai_body)
+    # 思考强度：与 OpenAI 路径同一套优先级（见 apply_reasoning_effort）
+    apply_reasoning_effort(request, oai_body)
+
+    model_name = oai_body.get("model", "")
+    req_model = str(body.get("model") or "")
+    emit_thinking = bool(CFG.get("anthropic_emit_thinking", False))
+    attempts = max(1, int(CFG.get("upstream_retries", 4)))
+    _t0 = time.time()
+    LOG.info(
+        "anthropic messages model=%s stream=%s tools=%d effort=%s",
+        model_name, bool(oai_body.get("stream")), len(oai_body.get("tools") or []),
+        oai_body.get("reasoning_effort") or "-",
+    )
+
+    if not oai_body.get("stream"):
+        r = None
+        for i in range(attempts):
+            wait_rate_cooldown()
+            with client() as cli:
+                r = cli.post(upstream("/api/chat/completions"), headers=fwd_headers(), json=oai_body)
+            if r.status_code == 200:
+                break
+            LOG.warning(
+                "upstream anthropic %d (attempt %d/%d): %s",
+                r.status_code, i + 1, attempts, r.text[:200],
+            )
+            note_rate_limited(r.status_code, r.text, "anthropic")
+            if i < attempts - 1 and remap_model_after_not_found(oai_body, r.text, req_model):
+                continue
+            if i < attempts - 1 and is_rate_limited(r.status_code, r.text):
+                time.sleep(backoff(i))
+                continue
+            if r.status_code in (401, 403):
+                return _anth_error("学校登录令牌已失效，请重新运行 1.获取令牌.bat", r.status_code)
+            return _anth_error(r.text[:400], r.status_code)
+        if r is None or r.status_code != 200:
+            status = getattr(r, "status_code", 502)
+            text = getattr(r, "text", "")
+            if status in (401, 403):
+                return _anth_error("学校登录令牌已失效，请重新运行 1.获取令牌.bat", status)
+            return _anth_error((text or "")[:400], status)
+        model_name = str(oai_body.get("model") or model_name)
+        try:
+            data = r.json()
+        except Exception:  # noqa: BLE001
+            return _anth_error("上游返回的不是 JSON", 502)
         record_usage_from(data, model=str(model_name or ""),
                           effort=str(oai_body.get("reasoning_effort") or ""),
                           ms=(time.time() - _t0) * 1000, stream=False)
@@ -1523,20 +1434,19 @@ async def anthropic_messages(request: Request):
         )
 
     # ---- 流式 ----
-    streamer = anthropic_compat.AnthropicStreamer(model_name, emit_thinking)
-    do_clean = bool(CFG.get("clean_think_tags", True))
-    cleaner = ThinkCleaner()
-    tail: dict = {}
-    last_usage: dict = {}  # 最后一次带 usage 的事件（流读完统一记一次）
-    anth_state = {"finished": False, "aborted": False, "closing": b""}
-
-    def anth_finalize() -> None:
-        """收尾：统计用量 + 生成 message_stop 帧。只放在 finally 里、本身不 yield。"""
-        try:
+    streamer = anthropic_compat.AnthropicStreamer(model_name, emit_thinking)
+    last_usage: dict = {}  # 最后一次带 usage 的事件（流读完统一记一次）
+    anth_state = {"finished": False, "aborted": False, "closing": b""}
+    ttft_ms = {"v": None}
+
+    def anth_finalize() -> None:
+        """收尾：统计用量 + 生成 message_stop 帧。只放在 finally 里、本身不 yield。"""
+        try:
             if last_usage:
                 record_usage_from(last_usage, model=str(model_name or ""),
                                   effort=str(oai_body.get("reasoning_effort") or ""),
-                                  ms=(time.time() - _t0) * 1000, stream=True)
+                                  ms=(time.time() - _t0) * 1000, stream=True,
+                                  ttft_ms=ttft_ms["v"])
         except Exception:  # noqa: BLE001
             LOG.exception("anthropic finalize: 用量统计失败")
         try:
@@ -1550,7 +1460,7 @@ async def anthropic_messages(request: Request):
 
     def gen():
         try:
-            for ev in _upstream_sse_events(oai_body):
+            for ev in _upstream_sse_events(oai_body, req_model):
                 if ev.startswith(b"__ERROR__"):
                     _, detail = ev.split(b":", 1)
                     yield anthropic_compat._sse(
@@ -1562,36 +1472,33 @@ async def anthropic_messages(request: Request):
                     )
                     anth_state["finished"] = True
                     return
-                ev2 = _clean_event(ev, cleaner, tail) if do_clean else ev
-                if not ev2.startswith(b"data:"):
-                    continue
-                payload = ev2[5:].strip()
-                if payload == b"[DONE]" or not payload:
-                    break
-                try:
-                    obj = json.loads(payload.decode("utf-8", "replace"))
-                except Exception:  # noqa: BLE001
-                    continue
-                if obj.get("usage"):
-                    last_usage.clear()
-                    last_usage.update(obj)
-                out = streamer.feed(obj)
-                if out:
-                    yield out
-            # 补发被暂留的内容
-            if do_clean and not cleaner.locked and tail:
-                left = cleaner.finish()
-                if left:
-                    tail_obj = json.loads(json.dumps(tail))
-                    for ch in tail_obj.get("choices") or []:
-                        d = ch.get("delta") or {}
-                        if "content" in d:
-                            d["content"] = left
-                            d.pop("reasoning_content", None)
-                    out = streamer.feed(tail_obj)
-                    if out:
-                        yield out
-            anth_state["finished"] = True
+                if not ev.startswith(b"data:"):
+                    continue
+                payload = ev[5:].strip()
+                if payload == b"[DONE]" or not payload:
+                    break
+                try:
+                    obj = json.loads(payload.decode("utf-8", "replace"))
+                except Exception:  # noqa: BLE001
+                    continue
+                if obj.get("usage"):
+                    last_usage.clear()
+                    last_usage.update(obj)
+                if ttft_ms["v"] is None:
+                    for ch in obj.get("choices") or []:
+                        d = ch.get("delta") or {}
+                        rc, c = d.get("reasoning_content"), d.get("content")
+                        if ((isinstance(rc, str) and rc)
+                                or (isinstance(c, str) and c)
+                                or d.get("tool_calls")):
+                            ttft_ms["v"] = (time.time() - _t0) * 1000
+                            break
+                if not streamer.started:
+                    streamer.model = str(oai_body.get("model") or streamer.model)
+                out = streamer.feed(obj)
+                if out:
+                    yield out
+            anth_state["finished"] = True
         except GeneratorExit:
             # 客户端断开：不能再 yield（否则 "generator ignored GeneratorExit"，
             # 且 finally 之后的代码会被跳过）。收尾交给 finally + anth_finalize()。

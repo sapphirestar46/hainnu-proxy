@@ -7,7 +7,6 @@
   "default_model": "",
   "aliases": {},
   "static_models": [],
-  "clean_think_tags": true,
   "anthropic_emit_thinking": false,
   "extra_body": {
     "reasoning_effort": "medium"

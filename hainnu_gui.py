@@ -76,8 +76,7 @@ OR_FLASH_IDS = (
     "deepseek/deepseek-v4-flash",
     "deepseek/deepseek-v4-flash-latest",
 )
-# 官方价自动获取：每天首次启动 GUI 时后台拉一次（见 _maybe_auto_update_price）。
-# 官方价格几个月才动一次，没必要每次启动/每次点都爬。
+# 官方价自动获取：每次启动 GUI 时后台拉一次（见 _maybe_auto_update_price）。
 # ⚠️ 现版本：桥会把上游的 prompt_cache_hit_tokens/miss 落盘，**省钱统计与实际命中率都改用实测值**；
 CACHE_HIT_RATIO_DEFAULT = 0.97
 
@@ -115,12 +114,28 @@ UI = {
     "chart_fill_rate": "#ECE1FC",
 }
 FONT_FAMILY = "Microsoft YaHei UI"
-F_TITLE   = (FONT_FAMILY, 13, "bold")   # 头部标题
 F_CARD    = (FONT_FAMILY, 10, "bold")   # 卡片标题
 F_BODY    = (FONT_FAMILY, 9)            # 正文
 F_SMALL   = (FONT_FAMILY, 8)            # 小字说明
 F_SMALL_B = (FONT_FAMILY, 8, "bold")    # 图表轴名
 F_MONO_S  = ("Consolas", 8)             # URL / Key 等单宽小字
+
+
+def set_taskbar_identity() -> None:
+    """给进程声明专属 AppUserModelID（Windows 任务栏身份）。
+
+    不声明时，任务栏会把窗口归到 `python.exe` / `pythonw.exe` 名下、用它的图标；
+    声明一个应用专属 ID 后，任务栏按钮才会采纳**本窗口自己设的图标**（app.ico 鲸鱼）。
+    必须在建窗之前调用。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "hainnu.proxy.management-console")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def load_port() -> int:
@@ -385,15 +400,6 @@ def cache_stats_since(cutoff: float) -> dict:
     if tot > 0:
         st["rate"] = st["hit_tokens"] / tot * 100
     return st
-
-
-def fmt_cache_line(st: dict) -> str:
-    """「命中 tokens / 总 tokens = 命中率%（命中 N 次）」；无信息时如实说明。"""
-    tot = st["hit_tokens"] + st["miss_tokens"]
-    if not tot:
-        return "—"
-    return (f"{fmt_tokens(st['hit_tokens'])}/{fmt_tokens(tot)}"
-            f" = {st['rate']:.1f}%（命中 {st['hit_requests']} 次）")
 
 
 def nice_ceil(v: float) -> float:
@@ -974,11 +980,17 @@ def stop_proxy_processes(port: int | None = None) -> int:
 
 class HainnuGUI(tk.Tk):
 
+    # 表格下拉到底后，等待多久才自动续载下一页：防止拖住滚动条一路到底时
+    # 把全部记录一次性抽出来。
+    TBL_LOAD_DELAY_MS = 1000
+
     def __init__(self):
+        set_taskbar_identity()   # 建窗前声明任务栏身份，任务栏按钮才会用我们的图标
         super().__init__()
         self.geometry("1240x860")
         self.minsize(1040, 720)
         self.configure(bg=UI["bg"])
+        self._set_window_icon()          # 窗口/任务栏图标：DeepSeek 鲸鱼
         self._user_name = _load_user_name()   # 登录时保存的姓名（get_token.py 写入 user_name.txt）
         self._last_greet_hour = time.localtime().tm_hour
         _gs = self._greet_suffix()
@@ -1029,8 +1041,7 @@ class HainnuGUI(tk.Tk):
         threading.Thread(target=self._load_name_async, daemon=True).start()
         # 启动时读一次真实开机自启状态，让按钮准确显示「已设开机自启 / 启用开机自启」
         threading.Thread(target=self._init_autostart_label, daemon=True).start()
-        # 价格：先用缓存/基准价把标签填好（否则一直显示“未获取”），
-        # 缓存过期才后台静默拉一次 —— 官方价格几个月才动一次，不必每次启动都爬。
+        # 价格：先用缓存/基准价把标签填好（否则一直显示“未获取”），再后台静默拉一次官方价。
         self._refresh_price_label()
         self._maybe_auto_update_price()
         self.after(300, self._drain)
@@ -1038,21 +1049,36 @@ class HainnuGUI(tk.Tk):
 
     # ---------------------------------------------------------------- UI 构建
 
+    def _set_window_icon(self) -> None:
+        """窗口与任务栏图标：仓库内的 app.ico（DeepSeek 鲸鱼）；缺失或平台不支持则用默认。"""
+        p = BASE / "app.ico"
+        if not p.exists():
+            return
+        try:
+            self.iconbitmap(default=str(p))
+        except Exception:  # noqa: BLE001
+            pass
+
     def _build_ui(self):
         pad = {"padx": 12, "pady": 6}
 
         # ---- 纯样式小工具：卡片 / 按钮 / 标签 / 输入框（不改变任何交互行为） ----
         def card(parent, title):
-            """飞书式白卡片：白底 + 1px 细边框 + 卡片标题行 + 标题下细分隔线。"""
+            """飞书式白卡片：白底 + 1px 细边框 + 卡片标题行 + 标题下细分隔线。
+
+            返回 (卡片, 内容区, 标题行)——标题行交给调用方，可在右上角放状态点等。
+            """
             c = tk.Frame(parent, bg=UI["card"], bd=0,
                          highlightbackground=UI["border"], highlightthickness=1)
-            tk.Label(c, text=title, bg=UI["card"], fg=UI["text_main"],
-                     font=F_CARD, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+            head = tk.Frame(c, bg=UI["card"])
+            head.pack(fill="x", padx=12, pady=(10, 4))
+            tk.Label(head, text=title, bg=UI["card"], fg=UI["text_main"],
+                     font=F_CARD, anchor="w").pack(side="left")
             tk.Frame(c, bg=UI["divider"], height=1, bd=0,
                      highlightthickness=0).pack(fill="x", padx=12)
             body = tk.Frame(c, bg=UI["card"])
             body.pack(fill="both", expand=True, padx=12, pady=(8, 10))
-            return c, body
+            return c, body, head
 
         def btn(parent, text, cmd, width, kind="secondary", font=F_BODY):
             """飞书两级按钮：primary=蓝底白字，secondary=白底描边；悬停仅变底色。"""
@@ -1115,27 +1141,19 @@ class HainnuGUI(tk.Tk):
                   foreground=[("selected", UI["text_main"])])
         style.configure("Usage.Treeview", indent=0)
 
-        # 头部：白底标题栏 + 状态点，下方一条细分隔线
-        head = tk.Frame(self, bg=UI["card"])
-        head.pack(fill="x")
-        self.l_head = tk.Label(head, text="Hainnu Proxy · 本地 OpenAI / Anthropic 接口",
-                               bg=UI["card"], fg=UI["text_main"], font=F_TITLE)
-        self.l_head.pack(side="left", padx=20, pady=14)
-        self.status_dot = tk.Canvas(head, width=16, height=16, bg=UI["card"],
-                                    highlightthickness=0)
-        self.status_dot.pack(side="right", padx=(0, 8))
-        self.status_txt = tk.Label(head, text="未检测", bg=UI["card"],
-                                   fg=UI["text_hint"], font=F_BODY)
-        self.status_txt.pack(side="right", padx=(0, 10))
-        tk.Frame(self, bg=UI["divider"], height=1, bd=0,
-                 highlightthickness=0).pack(fill="x")
-
         # 顶部三栏横排（横向紧凑放下）：运行状态 / 费用估算·省钱 / 连接配置
         top_row = tk.Frame(self, bg=UI["bg"])
         top_row.pack(fill="x", **pad)
 
-        box, box_body = card(top_row, "运行状态")
+        box, box_body, box_head = card(top_row, "运行状态")
         box.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        # 在线状态（红绿点 + 文字）从原页眉移到「运行状态」卡片右上角
+        self.status_dot = tk.Canvas(box_head, width=16, height=16, bg=UI["card"],
+                                    highlightthickness=0)
+        self.status_dot.pack(side="right")
+        self.status_txt = tk.Label(box_head, text="未检测", bg=UI["card"],
+                                   fg=UI["text_hint"], font=F_SMALL)
+        self.status_txt.pack(side="right", padx=(0, 6))
         self.l_run = lbl(box_body, "代理：—", fg=UI["text_main"], anchor="w")
         self.l_run.pack(fill="x")
         # 持续运行时长、速率各自独立一行（不挤进“代理”那一行小字）
@@ -1153,7 +1171,7 @@ class HainnuGUI(tk.Tk):
         self.l_rl = lbl(box_body, "限流：—", fg=UI["text_hint"], anchor="w")
         self.l_rl.pack(fill="x")
 
-        cost, cost_body = card(top_row, "费用估算 · 省钱")
+        cost, cost_body, _cost_head = card(top_row, "费用估算 · 省钱")
         cost.pack(side="left", fill="both", expand=True, padx=8)
         prow = tk.Frame(cost_body, bg=UI["card"])
         prow.pack(fill="x")
@@ -1192,12 +1210,20 @@ class HainnuGUI(tk.Tk):
         t2, self.l_tokens_today, self.l_tokens_today_sub = stat_tile(
             grid, "#DBEAFE", "#2563EB", "今", "今日消耗", UI["text_main"])
         t2.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
+        eq = tk.Frame(t2.winfo_children()[0], bg=TILE_BG)
+        eq.pack(side="right", padx=(8, 40))
+        tk.Label(eq, text="等价于", bg=TILE_BG, fg=UI["text_secondary"],
+                 font=F_SMALL, anchor="e").pack(fill="x")
+        self.l_today_equiv = tk.Label(eq, text="—", bg=TILE_BG, fg=UI["success"],
+                                      font=(FONT_FAMILY, 13, "bold"), anchor="e")
+        self.l_today_equiv.pack(fill="x")
         t3, self.l_tokens_total, self.l_tokens_total_sub = stat_tile(
             grid, "#E0E7FF", "#4F46E5", "Σ", "累计消耗", UI["text_main"])
         t3.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
         t4, self.l_cache, self.l_cache_sub = stat_tile(
             grid, "#EDE9FE", "#7C3AED", "%", "缓存命中（今日）", UI["text_main"])
         t4.grid(row=1, column=1, sticky="nsew")
+        self.l_cache_sub.config(wraplength=0)
 
         # 官方峰/谷状态：峰值=波峰(红加粗“梁文峰”)，空闲=波谷(绿加粗“梁文谷”)
         pkrow = tk.Frame(cost_body, bg=UI["card"])
@@ -1214,7 +1240,7 @@ class HainnuGUI(tk.Tk):
                                 fg=UI["text_secondary"])
         self.l_price_note.pack(fill="x")
 
-        cfg, cfg_body = card(top_row, "连接配置")
+        cfg, cfg_body, _cfg_head = card(top_row, "连接配置")
         cfg.pack(side="left", fill="both", expand=True, padx=(8, 0))
         cdata = load_config()
 
@@ -1385,45 +1411,46 @@ class HainnuGUI(tk.Tk):
         self.canvas.pack(fill="both", expand=True, pady=(4, 0))
 
         self.tbl_frame = tk.Frame(use_body, bg=UI["card"])
+        # 底部计数行要**先**用 side="bottom" 占位：否则短面板里会被带 expand 的
+        # 表格树挤到可视区外（旧版「上一页/下一页」按钮就是这么消失的）。
+        foot = tk.Frame(self.tbl_frame, bg=UI["card"])
+        foot.pack(side="bottom", fill="x", pady=(6, 0))
+        self.l_tbl_count = tk.Label(foot, text="", bg=UI["card"],
+                                    fg=UI["text_hint"], font=F_SMALL)
+        self.l_tbl_count.pack(side="left")
         tree_row = tk.Frame(self.tbl_frame, bg=UI["card"])
-        tree_row.pack(fill="both", expand=True)
-        cols = ("ts", "effort", "tokens", "ms", "cost", "rate")
+        tree_row.pack(side="top", fill="both", expand=True)
+        cols = ("ts", "effort", "tokens", "ttft", "ms", "cost", "rate")
         self.usage_tree = ttk.Treeview(tree_row, columns=cols,
                                        show="tree headings", style="Usage.Treeview")
-        self.usage_tree.heading("#0", text="模型")
-        self.usage_tree.column("#0", width=200, minwidth=90, stretch=False, anchor="w")
-        heads = (("ts", "时间", 120, "w", False),
-                 ("effort", "推理等级", 84, "w", False),
-                 ("tokens", "输入 / 缓存 / 输出", 300, "e", False),
-                 ("ms", "用时", 72, "e", False),
-                 ("cost", "花费", 96, "e", False),
-                 ("rate", "命中率", 84, "e", False))
-        for cid, text, w, anc, stretch in heads:
-            self.usage_tree.heading(cid, text=text)
-            self.usage_tree.column(cid, width=w, minwidth=48, anchor=anc, stretch=stretch)
+        # 表格内容全部居中（含表头）
+        self.usage_tree.heading("#0", text="模型", anchor="center")
+        self.usage_tree.column("#0", width=200, minwidth=90, stretch=False,
+                               anchor="center")
+        heads = (("ts", "时间", 120, False),
+                 ("effort", "推理等级", 84, False),
+                 ("tokens", "输入 / 缓存 / 输出", 260, False),
+                 ("ttft", "首字", 72, False),
+                 ("ms", "总耗时", 72, False),
+                 ("cost", "花费", 96, False),
+                 ("rate", "命中率", 84, False))
+        for cid, text, w, stretch in heads:
+            self.usage_tree.heading(cid, text=text, anchor="center")
+            self.usage_tree.column(cid, width=w, minwidth=48, anchor="center",
+                                   stretch=stretch)
         self._ico_ds = self._load_ds_icon()
-        sb = ttk.Scrollbar(tree_row, orient="vertical",
-                           command=self.usage_tree.yview)
-        self.usage_tree.configure(yscrollcommand=sb.set)
-        self.usage_tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        pager = tk.Frame(self.tbl_frame, bg=UI["card"])
-        pager.pack(fill="x", pady=(6, 0))
-        self.btn_tbl_prev = btn(pager, "上一页", lambda: self._tbl_goto(self._tbl_page - 1),
-                                8, font=F_SMALL)
-        self.btn_tbl_prev.pack(side="left")
-        self.l_tbl_page = tk.Label(pager, text="第 1 / 1 页", bg=UI["card"],
-                                   fg=UI["text_secondary"], font=F_SMALL)
-        self.l_tbl_page.pack(side="left", padx=10)
-        self.btn_tbl_next = btn(pager, "下一页", lambda: self._tbl_goto(self._tbl_page + 1),
-                                8, font=F_SMALL)
-        self.btn_tbl_next.pack(side="left")
-        self.l_tbl_count = tk.Label(pager, text="", bg=UI["card"],
-                                    fg=UI["text_hint"], font=F_SMALL)
-        self.l_tbl_count.pack(side="right")
+        # 翻页状态（下拉到底自动续载，见 _tbl_on_scroll）
         self._tbl_stamp = None
         self._tbl_recs: list = []
-        self._tbl_page = 0
+        self._tbl_loaded = 0          # 已插入表格的条数
+        self._tbl_in_load = False     # 防重入（插行会再次触发滚动回调）
+        self._tbl_pending = None      # 到底后待触发的续载定时器
+        sb = ttk.Scrollbar(tree_row, orient="vertical",
+                           command=self.usage_tree.yview)
+        self._tbl_sb = sb
+        self.usage_tree.configure(yscrollcommand=self._tbl_on_scroll)
+        self.usage_tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
 
         self._draw_empty()
 
@@ -2173,7 +2200,7 @@ class HainnuGUI(tk.Tk):
         except Exception:  # noqa: BLE001
             return None
 
-    def _row_cost(self, rec: dict) -> str:
+    def _rec_yuan(self, rec: dict) -> float:
         p = self.price or dict(FLASH_PRICE_FALLBACK)
         peak = beijing_peak(rec.get("ts"))
         hp = (p["in_hit_peak"] if peak else p["in_hit_off"]) / 1e6
@@ -2184,24 +2211,106 @@ class HainnuGUI(tk.Tk):
         ch = rec.get("cache_hit")
         if ch is None:
             ratio = CACHE_HIT_RATIO_DEFAULT
-            yuan = pin * (ratio * hp + (1 - ratio) * mp) + pout * out_p
-        else:
-            ch = int(ch or 0)
-            cm = int(rec.get("cache_miss") or 0)
-            if ch + cm <= 0:
-                cm = pin
-            yuan = ch * hp + cm * mp + pout * out_p
+            return pin * (ratio * hp + (1 - ratio) * mp) + pout * out_p
+        ch = int(ch or 0)
+        cm = int(rec.get("cache_miss") or 0)
+        if ch + cm <= 0:
+            cm = pin
+        return ch * hp + cm * mp + pout * out_p
+
+    def _row_cost(self, rec: dict) -> str:
+        yuan = self._rec_yuan(rec)
         return f"¥{yuan:.4f}" if yuan < 0.01 else f"¥{yuan:.2f}"
 
-    def _tbl_pages(self) -> int:
-        return max(1, (len(self._tbl_recs) + TABLE_PAGE - 1) // TABLE_PAGE)
+    def _today_equiv_yuan(self) -> float:
+        cutoff = calendar_anchor(86400) or 0.0
+        total = 0.0
+        try:
+            with open(USAGE_LOG, encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        rec = json.loads(s)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if (rec.get("ts") or 0) >= cutoff:
+                        total += self._rec_yuan(rec)
+        except Exception:  # noqa: BLE001
+            pass
+        return total
 
-    def _tbl_goto(self, page: int) -> None:
-        self._tbl_page = max(0, min(int(page), self._tbl_pages() - 1))
-        self._render_usage_page()
+    def _tbl_on_scroll(self, first, last) -> None:
+        """滚动条回调：同步滑块位置；停到底部满 1 秒才自动续载下一页。
+
+        用「停住一段时间」而非「一到就加载」：否则拖住滚动条一路下拉，
+        会连续触发、把整份记录一次性全拉出来。
+        """
+        self._tbl_sb.set(first, last)
+        try:
+            at_bottom = float(last) >= 0.999
+        except Exception:  # noqa: BLE001
+            at_bottom = False
+        if at_bottom:
+            if self._tbl_pending is None:
+                self._tbl_pending = self.after(self.TBL_LOAD_DELAY_MS,
+                                               self._tbl_load_more)
+        elif self._tbl_pending is not None:
+            self.after_cancel(self._tbl_pending)
+            self._tbl_pending = None
+
+    def _tbl_load_more(self) -> None:
+        """定时到点：追加一页；插行会再次触发滚动回调，故加标志防重入。"""
+        self._tbl_pending = None
+        if self._tbl_in_load or self._tbl_loaded >= len(self._tbl_recs):
+            return
+        self._tbl_in_load = True
+        try:
+            self._tbl_append(TABLE_PAGE)
+        finally:
+            self._tbl_in_load = False
+
+    def _tbl_append(self, count: int) -> None:
+        """把接下来的 count 条插到表尾，并刷新计数文案。"""
+        recs = self._tbl_recs
+        start, end = self._tbl_loaded, min(self._tbl_loaded + count, len(recs))
+        ico = self._ico_ds
+        tree = self.usage_tree
+
+        def _sec(v):
+            return f"{float(v) / 1000:.2f}s" if v is not None else "—"
+
+        for rec in recs[start:end]:
+            ts = rec.get("ts") or 0
+            prompt = int(rec.get("prompt") or 0)
+            completion = int(rec.get("completion") or 0)
+            hit, miss = rec.get("cache_hit"), rec.get("cache_miss")
+            if hit is None and miss is None:
+                cache_s, rate_s = "—", "—"
+            else:
+                hit = int(hit or 0)
+                den = hit + int(miss or 0)
+                cache_s = f"{hit:,}"
+                rate_s = f"{hit / den * 100:.1f}%" if den else "—"
+            model = str(rec.get("model") or "—")
+            kw = {}
+            if ico is not None and "deepseek" in model.lower():
+                kw["image"] = ico
+            tree.insert("", "end", text=model, values=(
+                time.strftime("%m-%d %H:%M:%S", time.localtime(ts)),
+                rec.get("effort") or "—",
+                f"{prompt:,} / {cache_s} / {completion:,}",
+                _sec(rec.get("ttft_ms")), _sec(rec.get("ms")),
+                self._row_cost(rec), rate_s), **kw)
+        self._tbl_loaded = end
+        total = len(recs)
+        self.l_tbl_count.config(
+            text=(f"共 {total} 条" if end >= total
+                  else f"共 {total} 条 · 已加载 {end}，下拉到底自动加载更多"))
 
     def _fill_usage_table(self) -> None:
-        """加载当前时间窗记录；翻页只重画当前 50 条。"""
+        """加载当前时间窗记录；表格靠「滚到底自动续载」，不再分页按钮。"""
         sec = self._window[0]
         cutoff = calendar_anchor(sec)
         if cutoff is None:
@@ -2232,51 +2341,27 @@ class HainnuGUI(tk.Tk):
                 recs = []
         recs.reverse()
         self._tbl_recs = recs
-        self._tbl_page = 0
         self._render_usage_page()
 
     def _render_usage_page(self) -> None:
+        """从第一页开始铺表格（首屏之后靠滚动续载）。"""
         tree = self.usage_tree
-        tree.delete(*tree.get_children())
-        recs = self._tbl_recs
-        pages = self._tbl_pages()
-        page = max(0, min(self._tbl_page, pages - 1))
-        self._tbl_page = page
-        start = page * TABLE_PAGE
-        chunk = recs[start:start + TABLE_PAGE]
-        ico = self._ico_ds
-        for rec in chunk:
-            ts = rec.get("ts") or 0
-            prompt = int(rec.get("prompt") or 0)
-            completion = int(rec.get("completion") or 0)
-            hit, miss = rec.get("cache_hit"), rec.get("cache_miss")
-            if hit is None and miss is None:
-                cache_s, rate_s = "—", "—"
-            else:
-                hit = int(hit or 0)
-                den = hit + int(miss or 0)
-                cache_s = f"{hit:,}"
-                rate_s = f"{hit / den * 100:.1f}%" if den else "—"
-            ms = rec.get("ms")
-            ms_s = f"{float(ms) / 1000:.2f}s" if ms is not None else "—"
-            model = str(rec.get("model") or "—")
-            kw = {}
-            if ico is not None and "deepseek" in model.lower():
-                kw["image"] = ico
-            tree.insert("", "end", text=model, values=(
-                time.strftime("%m-%d %H:%M:%S", time.localtime(ts)),
-                rec.get("effort") or "—",
-                f"{prompt:,} / {cache_s} / {completion:,}",
-                ms_s, self._row_cost(rec), rate_s), **kw)
-        self.l_tbl_page.config(text=f"第 {page + 1} / {pages} 页")
-        self.l_tbl_count.config(text=f"共 {len(recs)} 条 · 每页 {TABLE_PAGE}")
-        self.btn_tbl_prev.config(state=("disabled" if page <= 0 else "normal"))
-        self.btn_tbl_next.config(state=("disabled" if page >= pages - 1 else "normal"))
+        self._tbl_in_load = True      # 删/插行都会触发滚动回调，先压住防重入
+        try:
+            tree.delete(*tree.get_children())
+            self._tbl_loaded = 0
+            self._tbl_append(TABLE_PAGE)
+        finally:
+            self._tbl_in_load = False
 
     @staticmethod
     def _avg_unit_sec(sec: int) -> int:
-        """平均的统计单位（秒）：1小时→每分钟(60s)、24小时→每小时(3600s)、周/月→每天(86400s)。"""
-        return {3600: 60, 86400: 3600, 604800: 86400, 2592000: 86400}.get(sec, 3600)
+        """平均的统计单位（秒）：1小时→每分钟、24小时→每小时、周/月→每天。"""
+        if sec >= 604800:
+            return 86400
+        if sec >= 86400:
+            return 3600
+        return 60
 
     @staticmethod
     def _unit_name(sec: int) -> str:
@@ -2295,19 +2380,21 @@ class HainnuGUI(tk.Tk):
         return f"{run:.0f}分钟"
 
     def _elapsed_sec(self, sec: int) -> float:
-        """窗口内“实际已流逝”的秒数（平均分母的封顶）：周/月按日历起点到今天
-        （算进没使用的日子，但**不计今天之后**）；1小时/24小时是整段滑动窗。与运行时长相夹取小值。"""
-        up = getattr(self, "_up_sec", 0) or 0
-        if not up and getattr(self, "_online_since", None):
-            up = time.time() - self._online_since
-        if not up or up <= 0:
-            up = sec
-        if sec < 86400:                    # 1h / 24h：整段滑动窗
-            span = sec
-        else:                              # 1周/1月：日历起点(周一0点/1号0点) → 今天，不含未来
-            a = calendar_anchor(sec)
-            span = (time.time() - a) if a else sec
-        return min(up, span)
+        """均值分母：这段窗里已经过去的秒数。
+
+        用量日志跨重启保留，分子是窗内全部历史记录。24h/周/月按日历起点算到现在
+        （含空闲日、不含未来，且不超过窗长）；不能再和当前进程 uptime 取短，
+        否则刚启动时「每天」会变成整月总量。1 小时滑动窗仍与运行时长取短。
+        """
+        a = calendar_anchor(sec)
+        if a is None:
+            up = getattr(self, "_up_sec", 0) or 0
+            if not up and getattr(self, "_online_since", None):
+                up = time.time() - self._online_since
+            if not up or up <= 0:
+                up = sec
+            return min(up, float(sec))
+        return min(max(time.time() - a, 1.0), float(sec))
 
     def _avg_running(self, sec: int, unit_sec: int) -> float:
         """平均分母：窗口内实际运算时长折算成的单位数（每分钟/每小时/每天）。不足1单位按1算。"""
@@ -2315,34 +2402,53 @@ class HainnuGUI(tk.Tk):
         return units if units >= 1.0 else 1.0
 
     def _avg_text(self, sec: int, unit_sec: int,
-                  total_in: int, total_out: int, count: int) -> str:
-        """按图表单位、且只按“运行时”统计的均值（输入/输出 tokens 与请求数）。"""
+                  total_in: int, total_out: int, count: int,
+                  hit_t: int = 0, miss_t: int = 0) -> str:
+        """按图表单位折算的均值（输入/输出/缓存 tokens 与请求数）。"""
         run = self._avg_running(sec, unit_sec)
-        return (f"　均值({self._unit_name(sec)}·按运行时{self._run_display(unit_sec, run)}): "
-                f"输入 {fmt_tokens(total_in / run)} · 输出 {fmt_tokens(total_out / run)} · "
-                f"请求 {count / run:.2f}")
+        cache = ""
+        known = hit_t + miss_t
+        if known:
+            cache = f" · 缓存 {fmt_tokens(hit_t / run)}"
+        return (f"　均值({self._unit_name(sec)}·{self._run_display(unit_sec, run)}): "
+                f"输入 {fmt_tokens(total_in / run)} · 输出 {fmt_tokens(total_out / run)}"
+                f"{cache} · 请求 {count / run:.2f}")
 
     def _refresh_usage(self):
         sec, nb = self._window
         unit_sec = self._avg_unit_sec(sec)   # 平均单位：1h/分、24h/时、周月/天
         bins, bout, total_in, total_out, count, brate, (hit_t, miss_t) = agg_usage(sec, nb)
+        known = hit_t + miss_t
+        cache = ""
+        if known:
+            cache = (f" · 缓存 {fmt_tokens(hit_t)}/{fmt_tokens(known)}"
+                     f" = {hit_t / known * 100:.1f}%")
         self.l_sum.config(
             text=(f"输入 {fmt_tokens(total_in)} · 输出 {fmt_tokens(total_out)} · "
-                  f"合计 {fmt_tokens(total_in + total_out)} tokens · {count} 次请求"
-                  + self._avg_text(sec, unit_sec, total_in, total_out, count)))
+                  f"合计 {fmt_tokens(total_in + total_out)} tokens{cache} · {count} 次请求"
+                  + self._avg_text(sec, unit_sec, total_in, total_out, count,
+                                   hit_t, miss_t)))
         # 统计瓦片：累计 / 今日 tokens（历史全部；今日为本地 0 点起）
         self.l_tokens_total.config(text=fmt_tokens(cumulative_tokens()))
         self.l_tokens_total_sub.config(text=f"共 {cumulative_tokens():,} tokens")
         _today = today_tokens()
         self.l_tokens_today.config(text=fmt_tokens(_today))
         self.l_tokens_today_sub.config(text=f"共 {_today:,} tokens")
+        _eq = self._today_equiv_yuan()
+        self.l_today_equiv.config(
+            text=f"¥{_eq:.4f}" if _eq < 0.01 else f"¥{_eq:.2f}")
         # 缓存命中率（今日 / 累计）。两条口径都用 calendar_anchor 的「0 点」起点。
         _ca = cache_stats_since(0.0)
         if _ca["known_requests"]:
             _ct = cache_stats_since(calendar_anchor(86400) or 0.0)
             self.l_cache.config(text=fmt_tokens(_ct["hit_tokens"]))
+            tot = _ca["hit_tokens"] + _ca["miss_tokens"]
+            cum = (f"{fmt_tokens(_ca['hit_tokens'])}/{fmt_tokens(tot)} = {_ca['rate']:.1f}%"
+                   if tot else "—")
             self.l_cache_sub.config(
-                text=f"命中率 {(_ct['rate'] or 0):.1f}% · 累计 {fmt_cache_line(_ca)}")
+                text=(f"命中率 {(_ct['rate'] or 0):.1f}%\n"
+                      f"累计 {cum}\n"
+                      f"命中次数 {_ca['hit_requests']}"))
         else:
             self.l_cache.config(text="—")
             self.l_cache_sub.config(text="暂无缓存信息（重启代理后记录）")
@@ -2796,8 +2902,7 @@ class HainnuGUI(tk.Tk):
                                     f"{self._mixed_input(p, self._measured_hit_ratio()):g}/百万"))
                     else:
                         self.q.put(("status",
-                                    f"官方价无变化（来源 {source}）"
-                                    "；GUI 统计的是 Flash 列，不是旁边的 v4-pro 列"))
+                                    f"官方价无变化（来源 {source}）"))
                 elif quiet:
                     self.q.put(("price", None))   # 静默失败：只刷新标签，不报错
                 else:
@@ -2807,18 +2912,7 @@ class HainnuGUI(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _maybe_auto_update_price(self):
-        """每天**首次**启动 GUI 时后台静默拉一次官方价。
-
-        按北京日历日判断：上次成功获取不是「今天」就拉；同一天内重复开关 GUI
-        不再拉（官方价格几个月才动一次，没必要每次启动都爬）。失败则保持原值，
-        下次启动仍会重试。
-        """
-        today = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
-        last = (time.strftime("%Y-%m-%d",
-                              time.gmtime(self.price_fetched_at + 8 * 3600))
-                if self.price_fetched_at else "")
-        if last == today:
-            return
+        """每次启动 GUI 时后台静默拉一次官方价。失败则保持原值。"""
         self._fetch_price_now(quiet=True)
 
     @staticmethod

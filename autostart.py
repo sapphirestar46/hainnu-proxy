@@ -25,6 +25,10 @@ TASK = "HainnuDeepSeekProxy"
 VBS = BASE / "run_hidden.vbs"
 LNK = "HainnuDeepSeekProxy.lnk"
 
+# 隐藏子进程控制台窗口：本脚本会被管理台在启动时调用（读自启状态），
+# 若内部的 schtasks / powershell / where 不隐藏，开界面时就会闪黑窗。
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:  # noqa: BLE001
@@ -45,6 +49,7 @@ def find_pythonw() -> Path | None:
             r = subprocess.run(
                 ["where", name], capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW,
             )
             for line in (r.stdout or "").splitlines():
                 if line.strip():
@@ -97,6 +102,7 @@ def install_shortcut() -> tuple[bool, str]:
     r = subprocess.run(
         ["powershell", "-NoProfile", "-Command", ps],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=CREATE_NO_WINDOW,
     )
     if r.returncode == 0 and shortcut_exists():
         return True, "启动文件夹快捷方式"
@@ -125,6 +131,7 @@ def task_exists() -> bool:
         r = subprocess.run(
             ["schtasks", "/query", "/tn", TASK],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW,
         )
         return r.returncode == 0
     except Exception:  # noqa: BLE001
@@ -139,6 +146,7 @@ def install_task() -> tuple[bool, str]:
             "/sc", "onlogon", "/rl", "limited", "/f",
         ],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=CREATE_NO_WINDOW,
     )
     if r.returncode == 0:
         return True, "计划任务"
@@ -150,6 +158,7 @@ def remove_task() -> bool:
         subprocess.run(
             ["schtasks", "/delete", "/tn", TASK, "/f"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW,
         )
     except Exception:  # noqa: BLE001
         return False
@@ -166,6 +175,7 @@ def start_now() -> bool:
         cwd=str(BASE),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=CREATE_NO_WINDOW,
     )
     for _ in range(20):
         time.sleep(1)
@@ -182,7 +192,8 @@ def stop_now() -> None:
     )
     try:
         subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps], capture_output=True
+            ["powershell", "-NoProfile", "-Command", ps], capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
         )
     except Exception:  # noqa: BLE001
         pass

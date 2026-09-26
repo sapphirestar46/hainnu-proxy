@@ -28,6 +28,7 @@
     python _setup_agent.py --agent workbuddy --mode direct
     python _setup_agent.py --agent dsh       --mode proxy  --config <配置文件路径>
     python _setup_agent.py --agent opencode  --mode direct  --dry-run   # 只看不改
+    python _setup_agent.py --agent dsh       --mode direct  --refresh-env   # 令牌轮换后只刷新 DSH 环境变量
 """
 from __future__ import annotations
 
@@ -213,6 +214,30 @@ def write_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+
+def set_user_env(var: str, value: str) -> tuple[bool, str]:
+    """写入用户级环境变量（HKCU\\Environment）并广播系统变更。
+
+    返回 (是否成功, 失败原因)。成功后**新启动**的进程即可读到；
+    已经在运行的进程（含旧终端）不受影响，需重启客户端。
+    """
+    try:
+        import winreg  # noqa: PLC0415
+        import ctypes  # noqa: PLC0415
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, var, 0, winreg.REG_SZ, value)
+        # 广播 WM_SETTINGCHANGE，让资源管理器等宿主刷新环境块
+        HWND_BROADCAST, WM_SETTINGCHANGE = 0xFFFF, 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
+            SMTO_ABORTIFHUNG, 5000, None)
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
 
 
 def strip_jsonc(t: str) -> str:
@@ -653,9 +678,27 @@ def main() -> int:
     ap.add_argument("--config", default=None, help="手动指定配置文件路径（自动定位失败时用）")
     ap.add_argument("--dry-run", action="store_true", help="只打印将写入的内容，不落盘")
     ap.add_argument("--yes", action="store_true", help="跳过交互确认")
+    ap.add_argument("--refresh-env", action="store_true",
+                    help="（DSH 专用）只刷新密钥环境变量，不改动任何配置文件；令牌轮换后用")
     args = ap.parse_args()
 
     cfg = load_project_config()
+
+    # 令牌轮换后的快捷刷新：不碰配置文件，只把最新密钥写回用户级环境变量。
+    if args.refresh_env:
+        if args.agent != "dsh":
+            raise SystemExit("[错误] --refresh-env 目前仅支持 --agent dsh。")
+        if args.mode == "proxy":
+            var, value = "HAINNU_API_KEY", cfg.get("local_api_key") or "sk-hainnu"
+        else:
+            var, value = "HAINNU_DIRECT_API_KEY", load_jwt()
+        ok, msg = set_user_env(var, value)
+        if not ok:
+            print("[失败] 环境变量写入未成功：%s\n  可手动执行：setx %s \"<密钥>\"" % (msg, var))
+            return 1
+        print("✓ 已刷新用户级环境变量 %s（长度 %d，值不回显）。" % (var, len(value)))
+        print("  重开终端 / 重启 DSH 后生效。")
+        return 0
 
     agent_label = {"opencode": "opencode", "workbuddy": "WorkBuddy", "dsh": "DeepSeek-Harness (DSH)"}[args.agent]
     mode_label = "经本地服务（127.0.0.1）" if args.mode == "proxy" else "直连学校"
@@ -722,13 +765,16 @@ def main() -> int:
 
     if args.agent == "dsh":
         var = "HAINNU_API_KEY" if args.mode == "proxy" else "HAINNU_DIRECT_API_KEY"
-        print("\n  DSH 从环境变量读密钥，配置文件里只写了变量名，还需设置一次：")
-        if args.mode == "proxy":
-            print("       setx %s \"%s\"" % (var, key))
+        print("\n  DSH 从环境变量读密钥，正在自动写入用户级环境变量：")
+        ok, msg = set_user_env(var, key)
+        if ok:
+            shown = key if args.mode == "proxy" else "学校 JWT（长度 %d，值不回显）" % len(key)
+            print("       ✓ %s = %s" % (var, shown))
+            print("     已广播系统变更：重开终端 / 重启 DSH 即可读到；")
+            print("     令牌轮换后重跑「更新令牌(DSH直连).bat」即可刷新，无需重新配置。")
         else:
-            print("       值为学校登录 JWT（与 token.txt 同源，等同密码，勿外传）")
-            print("       setx %s \"<JWT>\"" % var)
-        print("     设置后重开一个终端再启动 DSH，否则读不到新变量。")
+            print("       [未成功] %s" % msg)
+            print("       请手动设置后重开终端：setx %s \"<密钥>\"" % var)
     elif args.agent == "opencode":
         print("\n  验证：opencode models %s" % pid)
     else:

@@ -408,15 +408,20 @@ curl --noproxy '*' http://127.0.0.1:8787/v1/chat/completions \
 直连使用**学校登录 JWT**（非本地 `sk-hainnu`）。获取流程与本地服务无关：
 先执行 `1.获取令牌.bat` 完成一次登录（两条链路共用同一 `token.txt`）。
 
-**方式一：脚本更新（仅适用于 opencode）**
+**方式一：脚本更新（opencode / DSH）**
 
-执行 `更新令牌(opencode直连).bat`。**该脚本是 opencode 专用工具**：解密 `token.txt` 后，
-在 `~/.config/opencode/opencode.jsonc` 中**定点替换** `hainnu-direct` 块内的 `apiKey`，
-具备时间戳备份、写入后校验与失败自动回滚；完成后重启 opencode 生效。它只改写这一个字段，
-不会创建 provider 或改动其他配置（provider 本身需按 §8.2 自行写入）。
+- **opencode**：执行 `更新令牌(opencode直连).bat`。解密 `token.txt` 后，
+  在 `~/.config/opencode/opencode.jsonc` 中**定点替换** `hainnu-direct` 块内的 `apiKey`，
+  具备时间戳备份、写入后校验与失败自动回滚；完成后重启 opencode 生效。它只改写这一个字段，
+  不会创建 provider 或改动其他配置（provider 本身需按 §8.2 自行写入）。
+- **DSH**：执行 `更新令牌(DSH直连).bat`。把最新 JWT 写回用户级环境变量
+  `HAINNU_DIRECT_API_KEY`（DSH 的直连供应商通过 `apiKeyEnv` 读它，配置文件里不含密钥），
+  完成后重开终端 / 重启 DSH 生效。其「经本地服务」的 `hainnu` 供应商对应
+  `HAINNU_API_KEY`（本地 `sk-hainnu`，与令牌无关，无需刷新）。
 
-不适用：不使用 opencode（走方式二）；opencode 走本地服务的 `hainnu` 供应商（本地服务自行读取 `token.txt`，无需执行）；
-尚未配置 `hainnu-direct`（先按 §8.2 完成）。
+不适用：不使用 opencode / DSH（走方式二）；opencode 走本地服务的 `hainnu` 供应商（本地服务自行读取 `token.txt`，无需执行）；
+尚未配置 `hainnu-direct`（opencode 先按 §8.2 完成；DSH 直接运行 §8.6 的「配置到 DeepSeek-Harness(直连学校).bat」即可，
+配置时会一并自动写入该环境变量）。
 
 **方式二：手动填写（其他客户端）**
 
@@ -429,6 +434,10 @@ python -c "import token_codec;print(token_codec.decrypt(open('token.txt',encodin
 （有便携运行时则用 `runtime\python.exe -c "..."`，轻量包/源码用上面这条或 `.venv\Scripts\python.exe`。）
 
 将输出字符串填入客户端配置的 `apiKey`。
+
+更省事：打开管理台（`启动管理台.bat`），在「连接配置」卡里直接**复制**「直连URL」与
+「直连Key」两行——值与本节命令的输出同源（Key 在 GUI 启动时读取一次，重新登录令牌后
+需重启管理台刷新）。
 
 ⚠️ 该 JWT **不含过期时间**（payload 无 `exp` 字段），通常一次填写长期有效；需重新获取的情形同上 §6.3。
 该 JWT 等同账号凭据，禁止外传，禁止粘贴至对话、日志或代码仓库。
@@ -469,7 +478,7 @@ python -c "import token_codec;print(token_codec.decrypt(open('token.txt',encodin
 | 经本地服务但服务未运行 | 提示启动方式（`2.启动代理.bat` 并保持窗口开启 / 管理台）并询问是否**立即启动**；配置照常写入 |
 | 服务其实在运行 | `/health` 无响应也可能是它正在处理长请求（单线程），脚本会说明，不会误判为「没开」 |
 | 直连链路 | 提示 JWT 将**明文**写入客户端配置（等同账号密码，仅限本人），并要求确认 |
-| 任何链路 | 提示**重启客户端**（配置只在启动时读取）；DSH 还需设置环境变量 `HAINNU_API_KEY` / `HAINNU_DIRECT_API_KEY` |
+| 任何链路 | 提示**重启客户端**（配置只在启动时读取）；DSH 的密钥环境变量由脚本**自动写入**用户级环境变量（重开终端 / 重启 DSH 生效），令牌轮换后用 `更新令牌(DSH直连).bat` 刷新 |
 
 > 前置条件检查只探测本机 `127.0.0.1` 的 `/health`，不向学校服务器发起任何请求。
 

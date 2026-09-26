@@ -228,6 +228,7 @@ def check_references(names: list[str]) -> list[str]:
     """
     have = set(names)
     root_names = {n for n in names if "/" not in n}
+    base_names = {n.rsplit("/", 1)[-1] for n in names}
 
     def present(entry: str, ref: str) -> bool:
         if ref in have:
@@ -235,7 +236,11 @@ def check_references(names: list[str]) -> list[str]:
         d = entry.rsplit("/", 1)[0] if "/" in entry else ""
         if d and (d + "/" + ref) in have:
             return True
-        return ref in root_names
+        if ref in root_names:
+            return True
+        # 裸文件名：bat 里写 "一键配置/_setup_agent.py" 时正则只截到 "_setup_agent.py"，
+        # 用「包内是否存在同名文件」兜底（当前包内脚本名唯一，不会误判）。
+        return ref in base_names
 
     miss: set[str] = set()
     # 扩展名要列全（含 jsonc）：否则 "opencode.jsonc" 会被截成 "opencode.json"，
@@ -253,9 +258,13 @@ def check_references(names: list[str]) -> list[str]:
         txt = read_text_any(raw)
         # bat 里写 "%~dp0xxx.py"，%~dp0 会被正则当成 "dp0xxx.py" 的一部分 → 先抹掉
         txt = txt.replace("%~dp0", "").replace("%~dp0", "")
+        # Windows 路径分隔符统一成 "/"，否则 "一键配置\_setup_agent.py" 会被正则从
+        # 反斜杠后开始匹配，只剩 "_setup_agent.py" → 误报「引用了包里没有的文件」。
+        txt = txt.replace("\\", "/")
         for m in pat.findall(txt):
             m = m.lstrip("(")
-            if m in ALLOW_MISSING or present(entry, m):
+            # 带子目录的引用按「包内相对路径」解析（bat 里写 "一键配置/_setup_agent.py"）
+            if m in ALLOW_MISSING or present(entry, m) or present(entry, m.split("/")[-1]):
                 continue
             miss.add(f"{entry} -> {m}")
     return sorted(miss)

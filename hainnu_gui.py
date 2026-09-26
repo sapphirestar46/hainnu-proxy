@@ -65,6 +65,10 @@ PRICE_MODEL_KEY = "flash"
 # ---------------------------------------------------------------------------
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 OR_USD_CNY = 6.667
+# DeepSeek 官方价分「高峰/空闲」两档，空闲 = 高峰 × 该系数。官方定价页实测三档全是 5 折
+# （命中 0.02/0.04、未命中 1/2、输出 4/8）。OpenRouter 只给一个「标准价」，且实测等于
+# 官方**高峰**价（不含峰谷），故备用源要把标准价当高峰、再按此系数反推空闲价。
+OFFPEAK_RATIO = 0.5
 # OpenRouter 里 flash 的模型 id 优先级（官方改名时顺着往下找）
 OR_FLASH_IDS = (
     "deepseek/deepseek-v4.1-flash",
@@ -639,7 +643,10 @@ def _get_json(url: str, timeout: int = 25, headers: dict | None = None) -> dict 
 def fetch_price_openrouter() -> tuple[dict | None, str]:
     """备源：OpenRouter 的 /models JSON。结构化、不用解析 HTML，但给的是美元。
 
-    取 base pricing 当空闲价、overrides 里的最大值当高峰价，按 OR_USD_CNY 反推人民币。
+    OpenRouter 只给一个「标准价」，实测 = 官方高峰价（不含峰谷）。所以：
+      · 默认把 base pricing 当**高峰**价，空闲价按 OFFPEAK_RATIO 反推；
+      · 若 OpenRouter 将来自己给了 overrides，则退回「base=空闲、overrides 最大值=高峰」。
+    单位是 USD/token，×1e6 换百万 token，再按 OR_USD_CNY 折人民币。
     """
     try:
         data = _get_json(OPENROUTER_MODELS_URL)
@@ -677,18 +684,28 @@ def fetch_price_openrouter() -> tuple[dict | None, str]:
             return None
 
     pr = model.get("pricing") or {}
-    off = {"in_hit": usd(pr.get("input_cache_read")),
-           "in_miss": usd(pr.get("prompt")),
-           "out": usd(pr.get("completion"))}
-    # 高峰价：overrides 里取各项最大值（OpenRouter 按 UTC 时段给，正好对应官方峰/谷）
-    peak = dict(off)
-    for ov in pr.get("overrides") or []:
-        if not isinstance(ov, dict):
-            continue
-        for k, src in (("in_hit", "input_cache_read"), ("in_miss", "prompt"), ("out", "completion")):
-            v = usd(ov.get(src))
-            if v is not None and (peak[k] is None or v > peak[k]):
-                peak[k] = v
+    base = {"in_hit": usd(pr.get("input_cache_read")),
+            "in_miss": usd(pr.get("prompt")),
+            "out": usd(pr.get("completion"))}
+    if any(v is None for v in base.values()):
+        return None, "OpenRouter 价格字段缺失"
+
+    # OpenRouter 只给单一标准价（= 官方高峰价），不含峰谷。默认无 overrides：
+    #   peak = base，off = base × OFFPEAK_RATIO。
+    # 若它将来提供了 overrides（按 UTC 时段给），说明 base 其实是空闲价、overrides 才是高峰。
+    overrides = [ov for ov in (pr.get("overrides") or []) if isinstance(ov, dict)]
+    if overrides:
+        off = dict(base)
+        peak = dict(base)
+        for ov in overrides:
+            for k, src in (("in_hit", "input_cache_read"),
+                           ("in_miss", "prompt"), ("out", "completion")):
+                v = usd(ov.get(src))
+                if v is not None and (peak[k] is None or v > peak[k]):
+                    peak[k] = v
+    else:
+        peak = dict(base)
+        off = {k: v * OFFPEAK_RATIO for k, v in peak.items()}
     if any(v is None for v in (*off.values(), *peak.values())):
         return None, "OpenRouter 价格字段缺失"
 

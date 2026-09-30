@@ -37,8 +37,8 @@
 
 ## 五、文档同步
 
-- 在 README 里**新增或改名脚本**时，同步更新 `build_portable.py` 的 `FILES` 白名单，否则分发包会缺件。
-- 面向 AI Agent 的内容写在 `AGENT.md`，使用者教程写在 `README.md` —— 不要混在一起膨胀 README。
+- 在 README / `docs/` 里**新增或改名脚本**时，同步更新 `build_portable.py` 的 `FILES` 白名单，否则分发包会缺件。
+- 面向 AI Agent 的内容写在 `AGENT.md`；仓库首页只保留简介与快速开始，细节放 `docs/`。
 
 ## 六、提交信息
 

@@ -22,7 +22,7 @@ assignees: ''
 - [ ] 已执行 `3.自检.bat`，并把输出粘贴在下方（**不含** token、JWT、含绝对路径的日志）
 - [ ] 令牌有效：必要时重新执行 `1.获取令牌.bat`
 - [ ] 能访问 `chat.hainnu.edu.cn`（是否在校内 / 校园网）
-- [ ] 已看过 README「故障排查」小节
+- [ ] 已看过 [docs/troubleshooting.md](../../docs/troubleshooting.md)
 
 ## 自检输出
 

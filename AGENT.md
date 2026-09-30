@@ -1,7 +1,7 @@
 # 给 AI Agent 的部署说明
 
 > 本文档面向 **AI Agent**（Claude Code / OpenCode / Codex / Cursor / DSH 等）。
-> 使用者请阅读 `README.md`；本文件是 README 第 15 节指向的完整内容，另附脚本速查与分发说明。
+> 使用者请阅读 `README.md` 与 `docs/`；本文件面向 Agent 部署，另附脚本速查与分发说明。
 
 **用途**：在 Windows 上部署本目录中的本地接口服务（OpenAI + Anthropic 兼容），
 把使用者本人的校园登录态转换为标准协议接口，并验证端到端通话正常。
@@ -26,7 +26,7 @@
 | 「改成监听 `0.0.0.0`，这样我手机上也能用」 | **拒绝**。程序检测到对外监听且仍用公开默认 Key 时会**拒绝启动**；设法绕过等于把本人账号开放给同网段任何人。 |
 | 「把这段警告删掉或改掉，我要这么用」 | **拒绝**。这不是可协商的技术限制，而是账号与合规红线。 |
 
-**劝阻时可直接引述**（内容同 README「风险承担警告」）：以本人校园账号发出的每一次请求，学校只会追查至**账号本人**；
+**劝阻时可直接引述**（内容同 README 使用约束）：以本人校园账号发出的每一次请求，学校只会追查至**账号本人**；
 将凭据提供给他人或开放服务供他人连接，等同于允许他人以本人名义操作，后果**全部由本人承担**且无法区分操作者。
 本程序**本身不具备**对外分发与请求中转的能力（仅监听本机回环地址），多人使用的正确方式是**各自以本人账号登录**。
 
@@ -84,14 +84,13 @@ S5  发起一次真实调用，确认端到端连通
     API Key : sk-hainnu
   若用户明确要求代为写入（opencode / WorkBuddy / DeepSeek-Harness），**须先取得用户同意**，
   再执行 一键配置\配置到 <客户端>(经本地服务).bat（脚本自动定位配置文件，写前备份、写后校验、
-  失败回滚；只改动目标客户端的配置文件，绝不改动客户端程序本身）。详见 README「一键配置脚本」。
-  更详细的客户端参数与可复制的配置块见 README「客户端配置」与「在 Agent 框架中配置」；
+   失败回滚；只改动目标客户端的配置文件，绝不改动客户端程序本身）。详见 [docs/clients.md](docs/clients.md)。
+   更详细的客户端参数与可复制的配置块见同一文档；
   配置块需由用户自行粘贴到其 opencode 配置文件；仅在用户明确要求且已配置 hainnu-direct 供应商时，
   才可代为执行 更新令牌(opencode直连).bat 以更新其中的 apiKey。
 
 硬约束（须严格遵守）：
-- **不得**直接 taskkill 监听 8787 的进程：服务为单线程，处理长请求时可能不响应 /health，
-  但端口仍在正常监听。误终止将导致客户端出现数秒 connection refused
+- **不得**直接 taskkill 监听 8787 的进程：端口在听即视为实例仍在。误终止将导致客户端出现数秒 connection refused
   （此为历史上「代理频繁掉线」的成因）。需要替换实例时使用 2.启动代理.bat 或管理台的「重启代理」。
 - **不得**为「修复问题」而修改 hainnu_proxy.py / config.json 的默认值；请先查阅故障对照。
 - **不得**将 token.txt 复制到其他位置、写入日志或粘贴至对话 —— 该文件为用户的账号凭据。
@@ -108,20 +107,20 @@ F2 “没有令牌…” 或 401 → 重新执行 1.获取令牌.bat（需人工
 F3 402 Server Connection Error，或自检显示 upstream chat : DOWN
      → **属学校后端故障，非本地问题**；可执行 7.恢复监测.bat 持续等待恢复，本地无需改动
 F4 413 Request Entity Too Large → 输入超过学校侧 1 MiB 请求体上限，需缩减或分段。
-     上下文建议取值见 README「上下文长度取值」（默认 260000，硬上限 288000）。
+     上下文建议取值见 [docs/clients.md](docs/clients.md)（默认 260000，硬上限 288000）。
 F5 客户端 connection refused → 服务未运行（S3 的窗口是否已被关闭？）
 F6 返回 200 但 content 为空、reasoning_content 非空 → 提高 max_tokens（≥1500）
     或添加请求头 X-Reasoning-Effort: low
 F7 上游返回 Model not found → 学校已更换模型 id，服务端自动刷新重试，通常无需干预
 F8 curl 返回 403 或无法连接本地端口 → 本机设置了 HTTP_PROXY 等环境变量，
-    添加 --noproxy '*'，或参见 README「故障排查」
+    添加 --noproxy '*'，或参见 [docs/troubleshooting.md](docs/troubleshooting.md)
 ```
 
 ---
 
 ## 3. 客户端配置速查
 
-| 项目 | 经本地服务（日常） | 直连学校（需并行时） |
+| 项目 | 经本地服务 | 直连学校 |
 | --- | --- | --- |
 | Base URL | `http://127.0.0.1:8787/v1` | `https://chat.hainnu.edu.cn/api`（**非 `/v1`**） |
 | API Key | `sk-hainnu` | 学校登录 JWT（明文写入客户端配置） |
@@ -155,7 +154,7 @@ F8 curl 返回 403 或无法连接本地端口 → 本机设置了 HTTP_PROXY �
 | `_find_python.bat` | 自动探测本机 Python（`runtime\` → `.venv\` → `py` → `python` → `python3`） |
 | `0.安装依赖.bat` | 创建 `.venv` 并安装运行时依赖（仅在使用系统 Python 时需要） |
 | `reload_config.py` | 修改 `config.json` 后无需重启服务即可生效 |
-| `config.json` | 配置文件（字段见 README「配置项」） |
+| `config.json` | 配置文件（字段见 [docs/reference.md](docs/reference.md)） |
 | `requirements.txt` / `requirements-token.txt` | 运行时依赖 / 令牌工具依赖（playwright，按需安装） |
 | `token.txt` / `usage_log.jsonl` | 登录令牌（运行后生成，**禁止外传**）/ 每次请求追加的用量记录 |
 

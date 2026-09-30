@@ -11,7 +11,7 @@
   python set_context_window.py --apply    # 真正写入（自动备份 settings.yaml.bak）
   python set_context_window.py --value 262144 --apply   # 指定别的值
 
-取值依据（详见 README「DSH 自动压缩上下文」）：
+ 取值依据（详见 docs/clients.md「DeepSeek-Harness」）：
   模型窗口 ≥629k tokens（实测 base64 探针），官方规格 1024k in / 64k out，
   但学校 nginx 限制请求体 1MiB → 真实 token 上限约 22 万。
   DSH 的溢出救援要在撞墙前发生，所以 contextWindow 必须略低于真实上限 → 取 210,000。

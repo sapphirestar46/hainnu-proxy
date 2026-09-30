@@ -52,7 +52,7 @@ BASE = HERE.parent                      # 项目根目录（config.json、token.
 sys.path.insert(0, str(BASE))
 
 # ---- 部署内容 ---------------------------------------------------------------
-# 模型名只是「客户端侧显示/请求用的名字」，实际由服务端解析到上游真实 id（见 README §7.1）。
+# 模型名只是「客户端侧显示/请求用的名字」，实际由服务端解析到上游真实 id（见 docs/clients.md）。
 MODEL_ID = "deepseek-flash"
 MODEL_NAME_PROXY = "DeepSeek Flash（海师·经本地服务）"
 MODEL_NAME_DIRECT = "DeepSeek Flash（海师·直连）"
@@ -462,7 +462,7 @@ def dsh_block(pid: str, name: str, base: str, mode: str) -> str:
         f"      models:\n"
         f"        - id: {MODEL_ID}\n"
         f"          # 实测：学校 nginx 请求体上限 1MiB → 最坏密度下约 28.9 万 tokens，\n"
-        f"          # 260000 为留 10% 余量后的取值（见 README「上下文长度取值」）。\n"
+        f"          # 260000 为留 10% 余量后的取值（见 docs/clients.md）。\n"
         f"          contextWindow: {CONTEXT}\n"
         f"          maxTokens: {OUTPUT}\n"
     )

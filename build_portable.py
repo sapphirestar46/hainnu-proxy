@@ -47,8 +47,8 @@ FILES = [
     "6.关闭代理.bat",
     "7.恢复监测.bat",
     "8.设置上下文上限.bat",
-    "更新令牌(opencode直连).bat",    # 直连链路的令牌维护（README §8.5），属功能件
-    "更新令牌(DSH直连).bat",         # DSH 直连：刷新 HAINNU_DIRECT_API_KEY（README §8.5）
+    "更新令牌(opencode直连).bat",    # 直连链路的令牌维护（docs/clients.md），属功能件
+    "更新令牌(DSH直连).bat",         # DSH 直连：刷新 HAINNU_DIRECT_API_KEY
     "启动管理台.bat",
     "_find_python.bat",          # 上面几乎每个 bat 都要调它
     "start.bat",
@@ -67,7 +67,7 @@ FILES = [
     "set_context_window.py",
     "reload_config.py",
     "_update_direct_token.py",   # 更新令牌(opencode直连).bat 的依赖
-    # 一键配置（把接口写进 Agent 客户端的配置：统一核心 + 6 个入口，见 README §8.6）
+    # 一键配置（把接口写进 Agent 客户端的配置：统一核心 + 6 个入口，见 docs/clients.md）
     "一键配置/_setup_agent.py",
     "一键配置/配置到 opencode(经本地服务).bat",
     "一键配置/配置到 opencode(直连学校).bat",
@@ -81,7 +81,13 @@ FILES = [
     "test_dsh.py",
     # 文档与配置
     "README.md",
-    "AGENT.md",   # 给 AI Agent 的部署说明；README §14 指向此文件
+    "AGENT.md",
+    "docs/install.md",
+    "docs/clients.md",
+    "docs/reference.md",
+    "docs/troubleshooting.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
     "config.json",
     "requirements.txt",
     "requirements-token.txt",

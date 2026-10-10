@@ -282,29 +282,6 @@ def fmt_uptime(sec: float) -> str:
     return f"{m}分"
 
 
-def recent_tok_rate(seconds: float = 300.0) -> float:
-    """最近 N 秒的平均 tok/s（输入+输出），从 usage_log.jsonl 统计；无数据返回 0。"""
-    if not USAGE_LOG.exists():
-        return 0.0
-    cutoff = time.time() - seconds
-    acc = 0
-    try:
-        with open(USAGE_LOG, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:  # noqa: BLE001
-                    continue
-                if (rec.get("ts") or 0) >= cutoff:
-                    acc += (rec.get("prompt") or 0) + (rec.get("completion") or 0)
-    except Exception:  # noqa: BLE001
-        pass
-    return acc / seconds
-
-
 def cumulative_tokens() -> int:
     """历史累计消耗的 tokens 总量（输入+输出，全部记录），无数据返回 0。"""
     if not USAGE_LOG.exists():
@@ -1022,6 +999,14 @@ class HainnuGUI(tk.Tk):
         self.price = st["price"] or dict(FLASH_PRICE_FALLBACK)
         self._price_fetching = False   # 避免并发重复拉价
         self._last_prune = 0.0
+        self._usage_file_stamp = object()
+        self._chart_sig = None
+        self._chart_last = None       # 最近一次折线数据（窗口停稳后按新尺寸重绘用）
+        self._chart_resize_job = None # 画布缩放防抖定时器（拖动中不重绘，防卡顿）
+        self._last_chart_size = None  # 上次画布尺寸
+        self._last_win_size = None    # 上次窗口(客户区)尺寸
+        self._zoom = 1.0              # 窗口梯度缩放比例（基准 1240x860；停稳后统一应用）
+        self._font_widgets: list = [] # 主窗口里带字体的控件（基准字号存在 _base_font）
         self._rl_state = "ok"      # 限流提醒状态: ok/recent/now（用于状态条高亮提示）
         self._rl_restart_at = 0.0  # 限流冷却结束后 + 保守缓冲，届时自动重启代理的时间戳
         self._rl_last_auto = 0.0   # 上次自动重启时刻（防止刚重启又撞限流、再重启）
@@ -1115,6 +1100,7 @@ class HainnuGUI(tk.Tk):
 
         # ttk（仅「模型」下拉一个）统一到飞书观感：白底、细边、聚焦主蓝
         style = ttk.Style(self)
+        self._style = style      # 梯度缩放时重设行高/表头字号用
         try:
             style.theme_use("clam")
         except Exception:  # noqa: BLE001
@@ -1159,10 +1145,10 @@ class HainnuGUI(tk.Tk):
         # 持续运行时长、速率各自独立一行（不挤进“代理”那一行小字）
         self.l_uptime = lbl(box_body, "持续运行：—", anchor="w")
         self.l_uptime.pack(fill="x", pady=(6, 0))
-        self.l_speed = lbl(box_body, "速率：—", anchor="w")
-        self.l_speed.pack(fill="x")
-        self.l_speed_live = lbl(box_body, "实时输出：—", fg=UI["primary"], anchor="w")
+        self.l_speed_live = lbl(box_body, "实时速率：—", fg=UI["primary"], anchor="w")
         self.l_speed_live.pack(fill="x")
+        self.l_speed = lbl(box_body, "上一对话：—", anchor="w")
+        self.l_speed.pack(fill="x")
         self.l_health = lbl(box_body, "后端：—", fg=UI["text_hint"], anchor="w")
         self.l_health.pack(fill="x", pady=(6, 0))
         self.l_models = lbl(box_body, "模型：—", fg=UI["text_hint"], anchor="w")
@@ -1317,8 +1303,15 @@ class HainnuGUI(tk.Tk):
                                    anchor="w", font=F_SMALL, fg=UI["text_hint"],
                                    wraplength=250, justify="left")
         self._cfg_model_note.pack(fill="x")
-        btn(cfg_body, "保存", self._save_config_inline, 10, kind="primary",
-            font=(FONT_FAMILY, 9, "bold")).pack(anchor="w", pady=(8, 0))
+        btnrow = tk.Frame(cfg_body, bg=UI["card"])
+        btnrow.pack(anchor="w", pady=(8, 0))
+        btn(btnrow, "保存", self._save_config_inline, 10, kind="primary",
+            font=(FONT_FAMILY, 9, "bold")).pack(side="left")
+        # tk.Button 在 Windows 下不渲染 highlight 描边，用 1px 边框 Frame 包一层（配色同输入框边框）
+        one_box = tk.Frame(btnrow, bg=UI["border"], bd=0, highlightthickness=0)
+        one_box.pack(side="left", padx=(6, 0))
+        btn(one_box, "一键配置", self._open_agent_setup, 10, kind="secondary",
+            font=(FONT_FAMILY, 9, "bold")).pack(padx=1, pady=1)
 
         # 控制按钮
         ctrl = tk.Frame(self, bg=UI["bg"])
@@ -1409,6 +1402,8 @@ class HainnuGUI(tk.Tk):
                                 highlightthickness=1,
                                 highlightbackground=UI["border"])
         self.canvas.pack(fill="both", expand=True, pady=(4, 0))
+        # 窗口缩放：拖动期间不重绘（防卡顿），停稳后按新画布尺寸重绘一次（见 _redraw_after_resize）
+        self.canvas.bind("<Configure>", self._on_chart_configure, add="+")
 
         self.tbl_frame = tk.Frame(use_body, bg=UI["card"])
         # 底部计数行要**先**用 side="bottom" 占位：否则短面板里会被带 expand 的
@@ -1420,7 +1415,7 @@ class HainnuGUI(tk.Tk):
         self.l_tbl_count.pack(side="left")
         tree_row = tk.Frame(self.tbl_frame, bg=UI["card"])
         tree_row.pack(side="top", fill="both", expand=True)
-        cols = ("ts", "effort", "tokens", "ttft", "ms", "cost", "rate")
+        cols = ("ts", "effort", "tokens", "ttft", "ms", "spd", "cost", "rate")
         self.usage_tree = ttk.Treeview(tree_row, columns=cols,
                                        show="tree headings", style="Usage.Treeview")
         # 表格内容全部居中（含表头）
@@ -1429,11 +1424,12 @@ class HainnuGUI(tk.Tk):
                                anchor="center")
         heads = (("ts", "时间", 120, False),
                  ("effort", "推理等级", 84, False),
-                 ("tokens", "输入 / 缓存 / 输出", 260, False),
+                 ("tokens", "输入 / 缓存 / 输出", 240, False),
                  ("ttft", "首字", 72, False),
                  ("ms", "总耗时", 72, False),
-                 ("cost", "花费", 96, False),
-                 ("rate", "命中率", 84, False))
+                 ("spd", "平均速率", 88, False),
+                 ("cost", "花费", 88, False),
+                 ("rate", "命中率", 72, False))
         for cid, text, w, stretch in heads:
             self.usage_tree.heading(cid, text=text, anchor="center")
             self.usage_tree.column(cid, width=w, minwidth=48, anchor="center",
@@ -1453,6 +1449,9 @@ class HainnuGUI(tk.Tk):
         sb.pack(side="right", fill="y")
 
         self._draw_empty()
+        self._collect_fonts()
+        # 窗口整体尺寸变化（含表格视图、画布未映射时）：拖动中不处理，停稳后应用缩放
+        self.bind("<Configure>", self._on_window_configure, add="+")
 
     # ---------------------------------------------------------------- 模型栏
 
@@ -1573,6 +1572,166 @@ class HainnuGUI(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             self._cfg_status.config(text=f"保存失败：{exc}", fg=UI["danger"])
 
+    def _open_agent_setup(self):
+        """「一键配置」：探测本机已装的客户端，把两条链路（本地 127.0.0.1 / 直连学校）
+        同时写进它们的配置。
+
+        实际写入由 agent_config.py 完成（备份 → 校验 → 写回，失败自动回滚）；
+        本窗口只负责选目标与展示结果。客户端只在启动时读配置，写完要重启对应客户端。
+        """
+        dlg = getattr(self, "_agent_dlg", None)
+        if dlg is not None and dlg.winfo_exists():
+            dlg.lift()
+            dlg.focus_set()
+            return
+        try:
+            import agent_config as ac
+        except Exception as exc:  # noqa: BLE001
+            from tkinter import messagebox
+            messagebox.showerror("一键配置", f"加载 agent_config.py 失败：\n{exc}")
+            return
+
+        dlg = tk.Toplevel(self)
+        self._agent_dlg = dlg
+        dlg.title("一键配置到客户端")
+        dlg.configure(bg=UI["bg"])
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        try:
+            dlg.iconbitmap(default=str(BASE / "app.ico"))
+        except Exception:  # noqa: BLE001
+            pass
+
+        def dbtn(parent, text, cmd, width, kind="secondary", font=F_BODY):
+            if kind == "primary":
+                bg, fg, abg, afg = UI["primary"], "#FFFFFF", UI["primary_dark"], "#FFFFFF"
+                edge = UI["primary"]
+            else:
+                bg, fg, abg, afg = UI["card"], UI["text_regular"], UI["hover"], UI["text_main"]
+                edge = UI["border"]
+            b = tk.Button(parent, text=text, width=width, command=cmd,
+                          bg=bg, fg=fg, activebackground=abg, activeforeground=afg,
+                          relief="flat", bd=0, highlightthickness=1,
+                          highlightbackground=edge, highlightcolor=edge,
+                          font=font, cursor="hand2", takefocus=0)
+            b.bind("<Enter>", lambda _e, w=b, c=abg: w.config(bg=c))
+            b.bind("<Leave>", lambda _e, w=b, c=bg: w.config(bg=c))
+            return b
+
+        def dcheck(parent, text, var, pad=None):
+            c = tk.Checkbutton(parent, text=text, variable=var, bg=UI["card"],
+                               fg=UI["text_regular"], activebackground=UI["card"],
+                               activeforeground=UI["text_main"], selectcolor="#FFFFFF",
+                               font=F_SMALL, highlightthickness=0, bd=0,
+                               takefocus=0, cursor="hand2", anchor="w")
+            if pad is not None:
+                c.pack(anchor="w", pady=pad)
+            return c
+
+        body = tk.Frame(dlg, bg=UI["bg"])
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        panel = tk.Frame(body, bg=UI["card"], bd=0,
+                         highlightbackground=UI["border"], highlightthickness=1)
+        panel.pack(fill="x")
+        inner = tk.Frame(panel, bg=UI["card"])
+        inner.pack(fill="x", padx=12, pady=10)
+
+        port = getattr(self, "port", 8787)
+        det = ac.detect_agents()
+        tk.Label(inner, text=("将同时写入两条链路：经本地服务（127.0.0.1:%d）"
+                              " + 直连学校。已存在的条目只改 URL / Key，缺的才新建。"
+                              % port),
+                 bg=UI["card"], fg=UI["text_secondary"], font=F_SMALL,
+                 wraplength=540, justify="left").pack(anchor="w")
+
+        tk.Label(inner, text="写入哪些客户端（自动探测，未找到的不可勾选）：",
+                 bg=UI["card"], fg=UI["text_secondary"], font=F_SMALL
+                 ).pack(anchor="w", pady=(8, 0))
+        covars = {}
+        rowc = tk.Frame(inner, bg=UI["card"])
+        rowc.pack(anchor="w", pady=(2, 0))
+        for key, label in (("zcode", "ZCode"), ("opencode", "opencode"),
+                           ("workbuddy", "WorkBuddy"), ("dsh", "DeepSeek Harness (DSH)")):
+            found = bool(det.get(key, {}).get("found"))
+            covars[key] = tk.BooleanVar(value=found)
+            c = dcheck(rowc, label if found else label + "（未找到）", covars[key])
+            if not found:
+                c.config(state="disabled", fg=UI["text_hint"],
+                         disabledforeground=UI["text_hint"])
+            c.pack(side="left", padx=(0, 10))
+
+        hints = []
+        if not (BASE / "token.txt").exists():
+            hints.append("还没有登录令牌：本次只写本地链路，获取令牌后可再配置一次")
+        try:
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq ZCode.exe"],
+                               capture_output=True, text=True, timeout=4,
+                               creationflags=CREATE_NO_WINDOW)
+            if "zcode.exe" in (r.stdout or "").lower():
+                hints.append("ZCode 正在运行：它退出时可能覆盖刚写入的配置，建议先退出 ZCode")
+        except Exception:  # noqa: BLE001
+            pass
+        if hints:
+            tk.Label(inner, text="；".join(hints), bg=UI["card"], fg=UI["warning"],
+                     font=F_SMALL, wraplength=520, justify="left").pack(anchor="w",
+                                                                        pady=(6, 0))
+
+        rowb = tk.Frame(inner, bg=UI["card"])
+        rowb.pack(anchor="w", pady=(10, 0))
+        b_run = dbtn(rowb, "开始配置", None, 10, kind="primary",
+                     font=(FONT_FAMILY, 9, "bold"))
+        b_run.pack(side="left")
+        dbtn(rowb, "关闭", dlg.destroy, 6).pack(side="left", padx=(6, 0))
+
+        out = tk.Text(body, height=11, font=F_SMALL, wrap="word",
+                      relief="flat", bd=0, highlightthickness=1,
+                      highlightbackground=UI["border"], highlightcolor=UI["border"],
+                      bg="#FFFFFF", fg=UI["text_regular"],
+                      state="disabled", padx=8, pady=6)
+        out.pack(fill="both", expand=True, pady=(10, 0))
+        out.tag_config("ok", foreground=UI["success"])
+        out.tag_config("err", foreground=UI["danger"])
+        out.tag_config("dim", foreground=UI["text_hint"])
+        out.tag_config("hd", foreground=UI["text_main"], font=(FONT_FAMILY, 8, "bold"))
+
+        def log(msg, tag=None):
+            out.config(state="normal")
+            out.insert("end", msg + "\n", tag or ())
+            out.see("end")
+            out.config(state="disabled")
+
+        def run_setup():
+            agents = [k for k, v in covars.items() if v.get()]
+            if not agents:
+                log("没有可写入的客户端（未探测到或未勾选）。", "err")
+                return
+            log("开始写入（经本地服务 + 直连学校）…", "hd")
+            try:
+                results = ac.apply_many(agents)
+            except Exception as exc:  # noqa: BLE001
+                log(f"失败：{exc}", "err")
+                return
+            for r in results:
+                mark = {"skipped": "--", "cleared": "OK", "created": "OK",
+                        "updated": "OK"}.get(r["action"], "!!")
+                log("[%s] %s：%s" % (mark, ac.AGENT_LABELS.get(r["agent"], r["agent"]),
+                                     r["msg"]), "ok" if r["ok"] else "err")
+                for p in r["paths"]:
+                    log("      " + p, "dim")
+                if r["backup"]:
+                    log("      备份：" + r["backup"], "dim")
+            log("")
+            log("写入已生效到配置文件；客户端重启后读取。", "dim")
+
+        b_run.config(command=run_setup)
+        dlg._run = run_setup
+        dlg._vars = {"clients": covars,
+                     "detected": {k: bool(det.get(k, {}).get("found"))
+                                  for k in covars}}
+
+        dlg.update_idletasks()
+        dlg.geometry("+%d+%d" % (self.winfo_rootx() + 40, self.winfo_rooty() + 60))
+
     def _greet_suffix(self):
         """顶部问候后缀：按时段问候 +「，姓名/学号。」。
         没有姓名或学号信息时不返回问候（返回空串），顶部就不带问候。"""
@@ -1667,7 +1826,17 @@ class HainnuGUI(tk.Tk):
                         note.config(text=f"取模型失败：{payload[:70]}", fg=UI["danger"])
         except queue.Empty:
             pass
-        self._refresh_usage()
+        # 用量图会读完整 jsonl 并重绘 Canvas。每 300ms 做一次会在拖动窗口时把
+        # Windows 的移动消息堵在主线程里。日志没变就跳过。
+        stamp = None
+        try:
+            st = USAGE_LOG.stat()
+            stamp = (st.st_mtime, st.st_size)
+        except Exception:  # noqa: BLE001
+            pass
+        if stamp != self._usage_file_stamp:
+            self._usage_file_stamp = stamp
+            self._refresh_usage()
         self._update_peak_state()   # 跨 12:00/18:00 边界自动切换峰/谷
         # 问候只在整小时跨段时才更新（不随 300ms 频率抖动）：
         # 段边界：6(早上好)/9(上午好)/12(中午好)/14(下午好)/18(晚上好)/23(夜深了)
@@ -1698,8 +1867,8 @@ class HainnuGUI(tk.Tk):
             self._online_since = None
             self.l_run.config(text=f"代理：离线（http://127.0.0.1:{self.port} 无响应）")
             self.l_uptime.config(text="持续运行：—")
-            self.l_speed.config(text="速率：—")
-            self.l_speed_live.config(text="实时输出：—")
+            self.l_speed.config(text="上一对话：—")
+            self.l_speed_live.config(text="实时速率：—")
             self.l_health.config(text="学校后端：无法探测（代理未运行）")
             self.l_models.config(text="模型：—")
             return
@@ -1719,19 +1888,15 @@ class HainnuGUI(tk.Tk):
         self.l_run.config(
             text=f"代理：在线 · 端口 {self.port}{tok_tail}")
         self.l_uptime.config(text="持续运行：" + fmt_uptime(up))
-        rate = recent_tok_rate()              # 近 5 分钟平均 tok/s（含输入）
-        self.l_speed.config(text=("速率：近5分钟 " + f"{rate:,.1f} tok/s" if rate > 0
-                                  else "速率：—（近5分钟无请求）"))
-        # 实时输出速度（桥接流式转发时按内容估算，只计输出，接近 harness 读数）
         _ov = data.get("output_speed", 0.0) or 0.0
         if data.get("output_active"):
-            self.l_speed_live.config(text=f"实时输出：{_ov:,.1f} tok/s（出字中）",
+            self.l_speed_live.config(text=f"实时速率：{_ov:,.1f} tok/s",
                                      fg=UI["primary_dark"])
-        elif _ov > 0:
-            self.l_speed_live.config(text=f"实时输出：上次 {_ov:,.1f} tok/s",
-                                     fg=UI["primary"])
         else:
-            self.l_speed_live.config(text="实时输出：—（空闲）", fg=UI["text_hint"])
+            self.l_speed_live.config(text="实时速率：—（空闲）", fg=UI["text_hint"])
+        _last = data.get("last_tok_s", 0.0) or 0.0
+        self.l_speed.config(
+            text=f"上一对话：{_last:,.1f} tok/s" if _last > 0 else "上一对话：—")
         # 学校后端状态独立一行：有 probe 结果就刷新（并记住最新结果）；
         # 常规轮询（无 upstream_chat）时**保留**上一次上游自检结果，不覆盖回“—”。
         chat = data.get("upstream_chat")
@@ -2297,11 +2462,18 @@ class HainnuGUI(tk.Tk):
             kw = {}
             if ico is not None and "deepseek" in model.lower():
                 kw["image"] = ico
+            ms = rec.get("ms")
+            if rec.get("tok_s") is not None:
+                spd_s = f"{float(rec['tok_s']):.1f}"
+            elif ms and float(ms) > 0 and completion > 0:
+                spd_s = f"{completion / (float(ms) / 1000.0):.1f}"
+            else:
+                spd_s = "—"
             tree.insert("", "end", text=model, values=(
                 time.strftime("%m-%d %H:%M:%S", time.localtime(ts)),
                 rec.get("effort") or "—",
                 f"{prompt:,} / {cache_s} / {completion:,}",
-                _sec(rec.get("ttft_ms")), _sec(rec.get("ms")),
+                _sec(rec.get("ttft_ms")), _sec(rec.get("ms")), spd_s,
                 self._row_cost(rec), rate_s), **kw)
         self._tbl_loaded = end
         total = len(recs)
@@ -2459,10 +2631,138 @@ class HainnuGUI(tk.Tk):
         self._update_savings()
         self._refresh_price_label()
 
+    def _on_chart_configure(self, event):
+        """画布尺寸变化：拖动期间**不重绘**（防卡顿），停稳后重绘一次折线图。"""
+        size = (event.width, event.height)
+        if size == self._last_chart_size:
+            return
+        self._last_chart_size = size
+        if self._chart_resize_job is not None:
+            try:
+                self.after_cancel(self._chart_resize_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._chart_resize_job = self.after(250, self._redraw_after_resize)
+
+    def _on_window_configure(self, event):
+        """窗口(整体)尺寸变化：拖动期间不处理，停稳后统一应用梯度缩放。
+
+        注意：子控件的 <Configure> 会沿 bindtags 冒泡到顶层窗口，这里只认窗口自身的事件。
+        """
+        if event.widget is not self:
+            return
+        size = (event.width, event.height)
+        if size == self._last_win_size:
+            return
+        self._last_win_size = size
+        if self._chart_resize_job is not None:
+            try:
+                self.after_cancel(self._chart_resize_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._chart_resize_job = self.after(250, self._redraw_after_resize)
+
+    def _redraw_after_resize(self):
+        """窗口停稳后：先按窗口尺寸调整整体字号/元素高度，再重画曲线。"""
+        self._chart_resize_job = None
+        self._apply_zoom()
+        if self.var_view.get() != "chart":
+            return
+        data = getattr(self, "_chart_last", None)
+        if data is None:
+            self._draw_empty()
+        else:
+            self._draw_line(*data)
+
+    # ------------------------------------------------------- 窗口梯度缩放
+    def _collect_fonts(self):
+        """记下主窗口里所有带字体的控件及其基准字号（缩放时统一按比例改）。"""
+        stack = [self]
+        while stack:
+            w = stack.pop()
+            if getattr(w, "_base_font", None) is None:
+                try:
+                    spec = w.cget("font")
+                except Exception:  # noqa: BLE001
+                    spec = ""
+                if spec:
+                    w._base_font = spec
+                    self._font_widgets.append(w)
+            try:
+                stack.extend(w.winfo_children())
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _scale_font(spec, s: float):
+        """按比例缩放字体规格（接受元组或 cget 返回的字符串）；解析失败原样返回。"""
+        if isinstance(spec, (tuple, list)):
+            family, size, styles = str(spec[0]), spec[1], list(spec[2:])
+        else:
+            txt = (spec or "").strip()
+            if not txt:
+                return spec
+            if txt.startswith("{"):
+                end = txt.find("}")
+                family = txt[1:end]
+                rest = txt[end + 1:].split()
+            else:
+                parts = txt.split(None, 1)
+                family = parts[0]
+                rest = parts[1].split() if len(parts) > 1 else []
+            size, styles = 0, []
+            for tok in rest:
+                try:
+                    size = int(tok)
+                except ValueError:
+                    styles.append(tok)
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return spec
+        if not size:
+            return spec
+        return (family, max(7, int(abs(size) * s + 0.5)), *styles)
+
+    def _scaled(self, base):
+        """图表内绘制用字体：按当前缩放返回。"""
+        return self._scale_font(base, self._zoom)
+
+    def _apply_zoom(self, force: bool = False):
+        """按窗口尺寸梯度缩放：字号 + 表格行高 + 画布高度（基准 1240x860）。
+
+        拖动期间不调用（防卡顿）；窗口停稳后由 _redraw_after_resize 调一次。
+        """
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        s = math.sqrt((w / 1240.0) * (h / 860.0))
+        s = max(0.85, min(1.4, s))
+        if not force and abs(s - self._zoom) < 0.02:
+            return
+        self._zoom = s
+        alive = []
+        for wid in self._font_widgets:
+            try:
+                wid.config(font=self._scale_font(wid._base_font, s))
+                alive.append(wid)
+            except Exception:  # noqa: BLE001
+                pass      # 控件已销毁（如对话框关闭）→ 顺手从名单里清掉
+        self._font_widgets = alive
+        st = getattr(self, "_style", None)
+        if st is not None:
+            st.configure("Usage.Treeview", rowheight=int(28 * s + 0.5),
+                         font=self._scale_font(F_BODY, s))
+            st.configure("Usage.Treeview.Heading",
+                         font=self._scale_font(F_SMALL_B, s),
+                         padding=(int(6 * s + 0.5), int(4 * s + 0.5)))
+        self.canvas.config(height=int(240 * s + 0.5))
+
     def _draw_empty(self):
         c = self.canvas
         c.delete("all")
         self._chart_data = None
+        self._chart_last = None
         self._chart_hover_i = None
         self._render_hover()      # 清掉竖线/浮窗
         W = max(c.winfo_width(), 400)
@@ -2477,10 +2777,17 @@ class HainnuGUI(tk.Tk):
         （老记录没有 cache_hit 字段，当 0 画会造假谷底）。
         """
         c = self.canvas
+        self._chart_last = (bins, bout, brate, rate_totals)  # 缩放停稳后重绘的数据源
         W = c.winfo_width()
         H = c.winfo_height()
         if W < 50 or H < 50:
             W, H = 860, 240
+        sig = (W, H, tuple(bins), tuple(bout),
+               tuple(None if x is None else round(x, 3) for x in (brate or [])),
+               self._window[0], round(self._zoom, 3))
+        if sig == self._chart_sig and self._chart_hover_i is None:
+            return
+        self._chart_sig = sig
         c.delete("all")
         sec = self._window[0]
         # 右侧要放两列刻度：输出 + 缓存命中率（跟输出轴同一套画法，各占一列）
@@ -2494,7 +2801,8 @@ class HainnuGUI(tk.Tk):
         out_peak = hbout or (bout[-1] if n else 0)
         if not (in_peak or out_peak):   # 输入/输出均为空 → 暂无数据
             c.create_text(pad_l + cw / 2, pad_t + ch / 2,
-                          text="（该时间窗暂无用量数据）", fill=UI["text_hint"], font=F_BODY)
+                          text="（该时间窗暂无用量数据）", fill=UI["text_hint"],
+                          font=self._scaled(F_BODY))
             return
         # 双纵轴：输入(左) 与 输出(右) 各自独立量程，输出不再被输入的量级压扁。
         # 量程只看“已定历史桶”(排除正在增长的最新桶) → 新数据只抬高最右桶，旧曲线保持原样。
@@ -2547,9 +2855,9 @@ class HainnuGUI(tk.Tk):
                           fill=(UI["border"] if f == 0 else UI["divider"]))
             if f > 0:
                 c.create_text(pad_l - 8, gy, text=fmt_tokens(gv), anchor="e",
-                              fill=UI["text_hint"], font=F_SMALL)
+                              fill=UI["text_hint"], font=self._scaled(F_SMALL))
         c.create_text(pad_l - 8, base, text="0", anchor="e",
-                      fill=UI["text_hint"], font=F_SMALL)
+                      fill=UI["text_hint"], font=self._scaled(F_SMALL))
         # 右纵轴(输出)：右侧边框 + 独立刻度（橙色，对应输出曲线）
         rx = pad_l + cw
         c.create_line(rx, pad_t, rx, base, fill=UI["border"])
@@ -2558,9 +2866,9 @@ class HainnuGUI(tk.Tk):
             gy = pad_t + (1 - f) * (ch - 16)
             if f > 0:
                 c.create_text(rx + 5, gy, text=fmt_tokens(gv), anchor="w",
-                              fill=UI["chart_out"], font=F_SMALL)
+                              fill=UI["chart_out"], font=self._scaled(F_SMALL))
         c.create_text(rx + 5, base, text="0", anchor="w",
-                      fill=UI["chart_out"], font=F_SMALL)
+                      fill=UI["chart_out"], font=self._scaled(F_SMALL))
         # 右起第二条轴：缓存命中率（紫，0~100%）。跟输出轴完全同一套画法。
         rx2 = rx + 54
         c.create_line(rx2, pad_t, rx2, base, fill=UI["border"])
@@ -2569,27 +2877,27 @@ class HainnuGUI(tk.Tk):
             gy = pad_t + (1 - f) * (ch - 16)
             if f > 0:
                 c.create_text(rx2 + 5, gy, text=f"{gv:.0f}%", anchor="w",
-                              fill=UI["chart_rate"], font=F_SMALL)
+                              fill=UI["chart_rate"], font=self._scaled(F_SMALL))
         c.create_text(rx2 + 5, base, text="0%", anchor="w",
-                      fill=UI["chart_rate"], font=F_SMALL)
+                      fill=UI["chart_rate"], font=self._scaled(F_SMALL))
         # 三轴名：放在绘图区上沿的留白里（pad_t-12，刻度/图例都在其下方），不遮挡量尺
         c.create_text(pad_l / 2 + 10, pad_t - 12, text="输入(左轴)", fill=UI["primary"],
-                      font=F_SMALL_B)
+                      font=self._scaled(F_SMALL_B))
         c.create_text(rx + 5, pad_t - 12, text="输出", fill=UI["chart_out"],
-                      font=F_SMALL_B)
+                      font=self._scaled(F_SMALL_B))
         c.create_text(rx2 + 5, pad_t - 12, text="命中率", fill=UI["chart_rate"],
-                      font=F_SMALL_B)
+                      font=self._scaled(F_SMALL_B))
         # 图例：三条各占一行，样式完全一致
         c.create_line(pad_l + 6, pad_t + 6, pad_l + 26, pad_t + 6, fill=UI["primary"], width=2)
         c.create_text(pad_l + 30, pad_t + 6, text="输入", anchor="w",
-                      fill=UI["text_secondary"], font=F_SMALL)
+                      fill=UI["text_secondary"], font=self._scaled(F_SMALL))
         c.create_line(pad_l + 6, pad_t + 18, pad_l + 26, pad_t + 18, fill=UI["chart_out"], width=2)
         c.create_text(pad_l + 30, pad_t + 18, text="输出", anchor="w",
-                      fill=UI["text_secondary"], font=F_SMALL)
+                      fill=UI["text_secondary"], font=self._scaled(F_SMALL))
         c.create_line(pad_l + 6, pad_t + 30, pad_l + 26, pad_t + 30,
                       fill=COLOR_RATE, width=2)
         c.create_text(pad_l + 30, pad_t + 30, text="缓存命中率", anchor="w",
-                      fill=UI["text_secondary"], font=F_SMALL)
+                      fill=UI["text_secondary"], font=self._scaled(F_SMALL))
         # 横轴时间点：锚定窗标绝对时段起点；1h 滑动窗标相对当前时刻的时段起点
         now = time.time()
         step = int(sec / n)
@@ -2609,14 +2917,14 @@ class HainnuGUI(tk.Tk):
             start = (k_start + i) * step - tzoff          # 第 i 桶的墙钟起点(UTC epoch)
             lbl = time.strftime(fmt, time.localtime(start))
             c.create_text(x_i(i), base + 12, text=lbl, anchor="n",
-                          fill=UI["text_secondary"], font=F_SMALL)
+                          fill=UI["text_secondary"], font=self._scaled(F_SMALL))
         # 底部汇总（跟原来同一行，同一种分隔符风格）
         _sumb = ("输入 " + fmt_tokens(sum(bins)) + " / 输出 " + fmt_tokens(sum(bout)))
         if rate_totals and sum(rate_totals) > 0:
             _h, _m = rate_totals
             _sumb += f" / 命中率 {_h / (_h + _m) * 100:.1f}%"
         c.create_text(pad_l + cw / 2, base + 36, text=_sumb,
-                      fill=UI["text_secondary"], font=F_SMALL)
+                      fill=UI["text_secondary"], font=self._scaled(F_SMALL))
         # 悬停提示数据（含图内几何信息）+ 绑定鼠标事件：灰色竖线跟随鼠标；最邻近桶无数据时只画竖线
         self._chart_data = (bins, bout, brate, n, pad_l, cw, step, sec, pad_t, base)
         c.bind("<Motion>", self._chart_hover)
@@ -2673,12 +2981,12 @@ class HainnuGUI(tk.Tk):
         my = getattr(self, "_chart_hover_y", (pad_t + base) / 2)
         # 深色小底 + 白字，光标右上方（不超出画布右缘）
         ww = c.winfo_width()
-        bw = 250
+        bw = int(250 * self._zoom + 0.5)
         bx = min(mx + 14 + bw, ww - 4) - bw
         c.create_rectangle(bx, my - 26, bx + bw, my + 2, fill=UI["text_main"],
                            outline=UI["text_main"], tags="tip")
         c.create_text(bx + 6, my - 12, text=txt, anchor="w",
-                      fill="#FFFFFF", font=F_SMALL, tags="tip")
+                      fill="#FFFFFF", font=self._scaled(F_SMALL), tags="tip")
 
     def _chart_leave(self, event=None):
         self._chart_hover_i = None

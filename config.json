@@ -5,7 +5,9 @@
   "port": 8787,
   "local_api_key": "sk-hainnu",
   "default_model": "",
-  "aliases": {},
+  "aliases": {
+    "deepseek-v4-flash": "deepseek-flash"
+  },
   "static_models": [],
   "anthropic_emit_thinking": false,
   "extra_body": {

@@ -56,6 +56,7 @@ FILES = [
     # 核心代码
     "hainnu_proxy.py",
     "hainnu_gui.py",
+    "agent_config.py",           # 管理台「一键配置」核心：zcode/opencode/WorkBuddy/DSH 四家配置写入
     "app.ico",                   # 窗口/任务栏图标（DeepSeek 鲸鱼）
     "deepseek.png",              # 用量表 DeepSeek 模型图标
     "_port_guard.py",            # 2.启动代理.bat / 6.关闭代理.bat 的依赖（虽然带下划线，但是功能件）

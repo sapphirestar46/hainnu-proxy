@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+import zlib
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -98,6 +99,7 @@ LOG = setup_logger()
 # 令牌用量记录（供 GUI 统计历史流量）
 # ----------------------------------------------------------------------------
 USAGE_LOG = BASE_DIR / "usage_log.jsonl"
+_LAST_DIALOG = {"tok_s": 0.0}
 
 
 def _cache_from_usage(u: dict) -> tuple[int | None, int | None]:
@@ -159,6 +161,9 @@ def record_usage(prompt, completion, key: str = "",
             rec["ttft_ms"] = round(float(ttft_ms), 1)
         if stream is not None:
             rec["stream"] = bool(stream)
+        if ms is not None and ms > 0 and completion > 0:
+            rec["tok_s"] = round(completion / (float(ms) / 1000.0), 1)
+            _LAST_DIALOG["tok_s"] = rec["tok_s"]
         with open(USAGE_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001
@@ -176,13 +181,15 @@ _LIMIT_CALLS = 0
 # ----------------------------------------------------------------------------
 _OUT_LOCK = threading.Lock()
 _OUT = {"started": 0.0, "chars": 0, "tokens": 0, "active": False,
-        "last_speed": 0.0, "last_at": 0.0, "n": 0, "peak": 0}
+        "last_speed": 0.0, "last_at": 0.0, "n": 0, "peak": 0,
+        "samples": []}  # [(unix_ts, nchars), ...] 近几秒增量，算瞬时速率
 
 
 def _out_start() -> None:
     with _OUT_LOCK:
         if _OUT["n"] == 0:
-            _OUT.update(started=time.time(), chars=0, tokens=0, active=True, peak=0)
+            _OUT.update(started=time.time(), chars=0, tokens=0, active=True,
+                        peak=0, samples=[])
         _OUT["n"] += 1
         _OUT["peak"] = max(_OUT["peak"], _OUT["n"])
 
@@ -191,34 +198,50 @@ def _out_add(text: str) -> None:
     """流式中按内容长度估算输出 token（中文/英文混合粗略 /3）。"""
     if not text:
         return
+    now = time.time()
+    n = len(text)
     with _OUT_LOCK:
-        _OUT["chars"] += len(text)
+        _OUT["chars"] += n
         _OUT["tokens"] = max(1, int(_OUT["chars"] / 3))
+        samples = _OUT["samples"]
+        samples.append((now, n))
+        cutoff = now - 3.0
+        _OUT["samples"] = [s for s in samples if s[0] >= cutoff]
 
 
 def _out_end(final_tokens: int = 0) -> None:
-    """流结束：并发时不停表；全部结束后单流用服务端 token，多流用字符估算。"""
+    """流结束：并发时不停表；全部结束后记下刚才窗口里的瞬时速率。"""
     with _OUT_LOCK:
         _OUT["n"] = max(0, _OUT["n"] - 1)
         if _OUT["n"] > 0:
             return
-        if final_tokens > 0 and _OUT["peak"] <= 1:
-            _OUT["tokens"] = final_tokens
-        el = time.time() - (_OUT["started"] or time.time())
-        el = max(el, 0.05)
-        _OUT["last_speed"] = _OUT["tokens"] / el
-        _OUT["last_at"] = time.time()
+        now = time.time()
+        cutoff = now - 3.0
+        added = sum(n for t, n in _OUT["samples"] if t >= cutoff)
+        el = min(3.0, max(now - (_OUT["started"] or now), 0.05))
+        inst = (added / 3.0) / el
+        if final_tokens > 0 and _OUT["peak"] <= 1 and inst <= 0:
+            el2 = max(now - (_OUT["started"] or now), 0.05)
+            inst = final_tokens / el2
+        _OUT["last_speed"] = inst
+        _OUT["last_at"] = now
         _OUT["active"] = False
         _OUT["peak"] = 0
+        _OUT["samples"] = []
 
 
 def _out_speed() -> tuple[float, bool]:
-    """返回 (tok/s, 是否正在输出)。空闲时若超 60s 未输出则视为 0。"""
+    """近 3 秒窗口的瞬时 tok/s；空闲超过 60s 视为 0。"""
     with _OUT_LOCK:
+        now = time.time()
         if _OUT["active"]:
-            el = max(time.time() - _OUT["started"], 0.05)
-            return _OUT["tokens"] / el, True
-        if _OUT["last_at"] and (time.time() - _OUT["last_at"]) <= 60:
+            cutoff = now - 3.0
+            added = sum(n for t, n in _OUT["samples"] if t >= cutoff)
+            el = 3.0
+            if _OUT["started"] and now - _OUT["started"] < 3.0:
+                el = max(now - _OUT["started"], 0.05)
+            return (added / 3.0) / el, True
+        if _OUT["last_at"] and (now - _OUT["last_at"]) <= 60:
             return _OUT["last_speed"], False
         return 0.0, False
 
@@ -708,6 +731,60 @@ def aclient() -> httpx.AsyncClient:
     return _ACLIENT
 
 
+async def _iter_upstream_bytes(r: httpx.Response):
+    """读取上游流并产出「解码后」的字节，兼容网关「标了 gzip 却未压缩」的偶发缺陷。
+
+    背景：chat.hainnu.edu.cn 偶发（实测约 5%）把 SSE 响应标成 Content-Encoding: gzip，
+    实际 body 却是未压缩明文。httpx 的 aiter_bytes() 见头就解压，这类响应会直接抛
+    zlib.error(incorrect header check)，流在约 2 秒处中断（客户端表现为"模型请求失败"）。
+    这里改用 aiter_raw()（不自动解压），按响应头自行处理：
+      · 无 Content-Encoding  -> 明文直通；
+      · gzip                -> 先按 gzip 解压；若首个数据块就解压失败（gzip 前 2 字节
+                               即校验魔数，此时必然尚未产出任何数据），判定为
+                               「只标头、没压缩」，整个响应按明文直通；
+      · 其他编码（deflate/br 等）-> 仍交给 httpx 解码，行为与原来一致。
+    """
+    ce = (r.headers.get("content-encoding") or "").strip().lower()
+    if not ce:
+        async for chunk in r.aiter_raw():
+            if chunk:
+                yield chunk
+        return
+    if "gzip" not in ce:
+        async for chunk in r.aiter_bytes():
+            if chunk:
+                yield chunk
+        return
+
+    dec = zlib.decompressobj(16 + zlib.MAX_WBITS)  # 16+=gzip 容器
+    plain_fallback = False   # True = 已判定为「假 gzip」，按明文直通
+    first_chunk = True
+    decompressed = False
+    async for chunk in r.aiter_raw():
+        if not chunk:
+            continue
+        if plain_fallback:
+            yield chunk
+            continue
+        try:
+            out = dec.decompress(chunk)
+        except zlib.error:
+            if not first_chunk:
+                raise  # 解压中途才失败：数据真损坏，交给上层既有错误处理
+            LOG.warning("上游声明 gzip 但 body 未压缩（已知网关缺陷），本次流按明文透传")
+            plain_fallback = True
+            yield chunk
+            continue
+        first_chunk = False
+        if out:
+            decompressed = True
+            yield out
+    if decompressed and dec.eof:
+        tail = dec.flush()
+        if tail:
+            yield tail
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     yield
@@ -924,6 +1001,7 @@ async def health(request: Request, probe: int = 0):
     _spd, _act = _out_speed()
     info["output_speed"] = round(_spd, 1)
     info["output_active"] = _act
+    info["last_tok_s"] = round(float(_LAST_DIALOG.get("tok_s") or 0), 1)
     # /health?probe=1 会真的打一次上游，用来判断学校后端是否可用
     if probe:
         info["upstream_chat"] = probe_upstream()
@@ -1160,11 +1238,12 @@ async def _chat_impl(request: Request, key_id: str):
             rc = d.get("reasoning_content")
             if isinstance(rc, str) and rc:
                 reasoning_buf.append(rc)
+                _out_add(rc)
                 _mark_ttft()
             c = d.get("content")
             if isinstance(c, str) and c:
                 emitted["content"] = True
-                _out_add(c)   # 实时输出速度：按内容估算
+                _out_add(c)
                 _mark_ttft()
             if d.get("tool_calls"):
                 emitted["content"] = True
@@ -1275,7 +1354,7 @@ async def _chat_impl(request: Request, key_id: str):
     async def gen():
         try:
             buf = b""
-            async for chunk in r.aiter_bytes():
+            async for chunk in _iter_upstream_bytes(r):
                 if not chunk:
                     continue
                 buf += chunk
@@ -1337,7 +1416,7 @@ async def _upstream_sse_events(body: dict, req_model: str = ""):
                 status = r.status_code
                 if status == 200:
                     buf = b""
-                    async for chunk in r.aiter_bytes():
+                    async for chunk in _iter_upstream_bytes(r):
                         if not chunk:
                             continue
                         buf += chunk
@@ -1587,7 +1666,41 @@ def check_exposed_host(host: str) -> None:
                 host)
 
 
+class _NullStream:
+    """无控制台环境下的占位输出流。"""
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+def ensure_console_streams() -> None:
+    """pythonw（无控制台）启动时 sys.stdout / sys.stderr 是 None。
+
+    uvicorn 初始化会调用 sys.stdout.isatty()，直接抛 AttributeError 让进程秒退 ——
+    开机自启（快捷方式 → VBS → pythonw）因此从来没起来过。这里兜底：能写文件就追加到
+    hainnu_proxy.out.log（留一份启动输出便于排查），否则退化为空流。
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    sink: Any
+    try:
+        sink = open(BASE_DIR / "hainnu_proxy.out.log", "a", encoding="utf-8", buffering=1)
+    except OSError:
+        sink = _NullStream()
+    if sys.stdout is None:
+        sys.stdout = sink
+    if sys.stderr is None:
+        sys.stderr = sink
+
+
 def main() -> int:
+    ensure_console_streams()
     ap = argparse.ArgumentParser(description="hainnu Open WebUI -> OpenAI proxy")
     ap.add_argument("--host", default=None)
     ap.add_argument("--port", type=int, default=None)

@@ -13,6 +13,7 @@ private_patterns.txt
 # 运行时产物 / 本机状态
 # ---------------------------------------------------------------------------
 hainnu_proxy.log
+hainnu_proxy.log.*
 hainnu_proxy_gui.log
 usage_log.jsonl
 *.log

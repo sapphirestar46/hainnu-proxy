@@ -61,7 +61,12 @@ def find_pythonw() -> Path | None:
 
 def write_vbs() -> Path:
     """生成静默启动代理的 VBS。内容自动定位 VBS 自身所在目录（不写死路径），
-    所以整套文件夹无论拷到哪台机器、哪个路径，双击 / 开机调用都能用。"""
+    所以整套文件夹无论拷到哪台机器、哪个路径，双击 / 开机调用都能用。
+
+    解释器顺序：runtime\\ → .venv\\ → PATH 上的 pythonw.exe。
+    旧版只认前两个：直接复用系统 Python（没有 .venv）的机器会静默起不来。
+    启动失败时往 hainnu_proxy.out.log 追加一行 breadcrumb，而不是让 wscript 弹错误框。
+    """
     # 优先用内嵌 runtime，其次 .venv：VBS 自定位目录，整套文件夹可随意搬移。
     VBS.write_text(
         "Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
@@ -70,10 +75,18 @@ def write_vbs() -> Path:
         'ws.CurrentDirectory = base\n'
         'if fso.FileExists(base & "\\runtime\\pythonw.exe") then\n'
         '  py = base & "\\runtime\\pythonw.exe"\n'
-        'else\n'
+        'elseif fso.FileExists(base & "\\.venv\\Scripts\\pythonw.exe") then\n'
         '  py = base & "\\.venv\\Scripts\\pythonw.exe"\n'
+        'else\n'
+        '  py = "pythonw.exe"\n'
         'end if\n'
-        'ws.Run """" & py & """ """ & base & "\\hainnu_proxy.py""", 0, False\n',
+        'On Error Resume Next\n'
+        'ws.Run """" & py & """ """ & base & "\\hainnu_proxy.py""", 0, False\n'
+        'if Err.Number <> 0 then\n'
+        '  Set lf = fso.OpenTextFile(base & "\\hainnu_proxy.out.log", 8, True)\n'
+        '  lf.WriteLine "[" & Now & "] [autostart] start failed: 0x" & Hex(Err.Number) & " " & Err.Description\n'
+        '  lf.Close\n'
+        'end if\n',
         encoding="ascii",
     )
     return VBS
@@ -220,6 +233,9 @@ def do_install() -> int:
     print(f"解释器    : {pyw}")
     vbs = write_vbs()
     print(f"启动脚本  : {vbs}")
+    if not (BASE / "runtime" / "pythonw.exe").exists() and not (BASE / ".venv" / "Scripts" / "pythonw.exe").exists():
+        print("[提示] 本目录没有 runtime\\ 也没有 .venv\\：自启将改用 PATH 上的 pythonw.exe；")
+        print("       如果它缺少依赖，请先运行 2.启动代理.bat 准备好运行环境。")
 
     ok, how = install_shortcut()
     if ok:

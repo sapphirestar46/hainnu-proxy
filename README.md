@@ -28,6 +28,8 @@
 
 需要本地 Key、Anthropic 接口或用量面板时，通过本服务访问；OpenAI 兼容客户端也可以把 JWT 当作 apiKey **直连**上游（见[链路选择](docs/clients.md#链路选择)）。
 
+![管理台：运行状态、费用估算、历史令牌流量与连接配置](docs/images/console.png)
+
 ## 快速开始
 
 从 [Releases](https://github.com/sapphirestar46/hainnu-proxy/releases/latest) 下载发布包。**不要用仓库页面的 Code → Download ZIP**，这样下载的包里没有 `runtime\`。

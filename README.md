@@ -1,10 +1,6 @@
 # Hainnu Proxy
 
-把学校已部署的大模型（DeepSeek）接到本机，并提供 **OpenAI** 与 **Anthropic** 兼容接口。
-
-[Releases](https://github.com/sapphirestar46/hainnu-proxy/releases/latest) ·
-[部署说明](docs/install.md) · [客户端配置](docs/clients.md) · [参数与限制](docs/reference.md) ·
-[故障排查](docs/troubleshooting.md) · [安全策略](SECURITY.md) · [给 AI Agent](AGENT.md)
+把学校已部署的 DeepSeek 接到本机，提供 **OpenAI** 与 **Anthropic** 兼容接口。
 
 > **仅限海南师范大学本校师生使用**（须能通过学校 CAS 登录）。
 > 代码以 MIT 协议开源；**账号凭据与请求中转不在授权范围内**。
@@ -17,9 +13,9 @@
 
 **任何问题或想给我加学分请联系：<sapphirestar46@outlook.com>**
 
-## 简介
+## 这是什么
 
-学校 Open WebUI 只认登录 JWT，不认 API Key。本程序在 `127.0.0.1` 上补上凭据、归一化协议并记录用量，另外还提供 Anthropic 的 `/v1/messages` 接口。权限与本人登录校园网页时相同。
+学校 Open WebUI 只认登录 JWT，不认 API Key。本程序在 `127.0.0.1` 上补齐凭据、归一化协议并记录用量，另外还提供 Anthropic 的 `/v1/messages` 接口。权限与本人登录校园网页时相同。
 
 ```
 客户端  →  127.0.0.1:8787  →  chat.hainnu.edu.cn/api/chat/completions
@@ -34,20 +30,22 @@
 
 ## 快速开始
 
-请从 [Releases](https://github.com/sapphirestar46/hainnu-proxy/releases/latest) 下载发布包，不要使用仓库页面的 Code → Download ZIP（这样下载的包里没有 `runtime\`）。
+从 [Releases](https://github.com/sapphirestar46/hainnu-proxy/releases/latest) 下载发布包。**不要用仓库页面的 Code → Download ZIP**，这样下载的包里没有 `runtime\`。
 
 | 包 | 说明 |
 | --- | --- |
 | `hainnu-proxy.zip` | 含便携 Python，解压即用 |
 | `hainnu-proxy-scripts.zip` | 仅脚本，本机已有 Python 时用 |
 
-解压后：
+解压后三步：
 
-1. `1.获取令牌.bat` — 在弹出的 Chrome 里用校园账号登录（唯一需要人工的步骤）
-2. `2.启动代理.bat` — **保持窗口开启**；看到 `[ready] http://127.0.0.1:8787/v1` 即为启动完成
-3. `3.自检.bat` — 末尾应出现 `ALL TESTS PASSED`
+1. `1.获取令牌.bat` —— 在弹出的 Chrome 里用校园账号登录（唯一需要人工的步骤）
+2. `2.启动代理.bat` —— **保持窗口开启**，看到 `[ready] http://127.0.0.1:8787/v1` 即启动完成
+3. `3.自检.bat` —— 末尾应出现 `ALL TESTS PASSED`
 
-客户端填写：
+图形界面用 `启动管理台.bat`；要给 opencode / WorkBuddy / DSH 一键写入配置，见[客户端配置](docs/clients.md)。
+
+## 客户端怎么填
 
 | | 值 |
 | --- | --- |
@@ -56,9 +54,24 @@
 | API Key | `sk-hainnu` |
 | 模型 | 任意；服务端会解析为上游真实 id（见 `/v1/models`） |
 
-图形界面请用 `启动管理台.bat`；要给 opencode / WorkBuddy / DSH 一键写入配置，见 [客户端配置](docs/clients.md)。
+## 常见问题
 
-更详细的安装、依赖与开机自启说明见 [部署说明](docs/install.md)。
+**提示找不到 python，或 `runtime\` 缺失**
+执行 `0.安装依赖.bat`（需要系统 Python 3.11+ 且在 PATH 中），或改用带便携 Python 的发布包。
+
+**`auth_expired` / `401` / 提示没有令牌**
+令牌缺失或已失效，重新执行 `1.获取令牌.bat`。
+
+**返回 200 但 `content` 为空、`reasoning_content` 有内容**
+输出上限被思考占用（思考 token 计入 `max_tokens`）。服务端有意不把思维链降级成正文，请提高 `max_tokens`（≥1500）或下调该客户端的思考档。
+
+**`402 Server Connection Error`**
+学校侧问题——浏览器此刻发消息也会报同样的错。联系学校信息中心，期间可执行 `7.恢复监测.bat` 持续探测。
+
+**连本地端口返回 403 / 超时**
+本机设了全局代理环境变量，回环请求被转发。设置 `NO_PROXY=localhost,127.0.0.1,::1`，curl 加 `--noproxy '*'`。
+
+其余故障见[故障排查](docs/troubleshooting.md)。
 
 ## 文档
 
